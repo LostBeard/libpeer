@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "agent.h"
+#include "buffer.h"
 #include "config.h"
 #include "dtls_srtp.h"
 #include "peer_connection.h"
@@ -26,7 +27,8 @@ struct PeerConnection {
   DtlsSrtp dtls_srtp;
   Sctp sctp;
 
-  char sdp[CONFIG_SDP_BUFFER_SIZE];
+  Sdp local_sdp;
+  Sdp remote_sdp;
 
   void (*onicecandidate)(char* sdp, void* user_data);
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
@@ -37,6 +39,10 @@ struct PeerConnection {
   uint8_t agent_buf[CONFIG_MTU];
   int agent_ret;
   int b_local_description_created;
+
+  Buffer* audio_rb;
+  Buffer* video_rb;
+  Buffer* data_rb;
 
   RtpEncoder artp_encoder;
   RtpEncoder vrtp_encoder;
@@ -54,7 +60,6 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
@@ -64,16 +69,15 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return pc->agent_ret;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, buf, len);
-
-    if (ret > 0) {
-      break;
-    }
-
-    recv_max++;
+  // SpawnWear (Phase 7b): NON-BLOCKING. Do ONE agent_recv (which also services incoming ICE/STUN
+  // so the connection's keepalives keep flowing) and return WANT_READ if there's no DTLS data yet,
+  // instead of spinning CONFIG_TLS_READ_TIMEOUT times - that spun the pump task (mutex held =>
+  // froze the watch) and starved ICE (peer disconnected after ~8s during the DTLS handshake).
+  ret = agent_recv(&pc->agent, buf, len);
+  if (ret > 0) {
+    return ret;
   }
-  return ret;
+  return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -164,7 +168,19 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
+  if (pc->config.datachannel) {
+#if (CONFIG_DATA_BUFFER_SIZE) > 0
+    LOGI("Datachannel allocates heap size: %d", CONFIG_DATA_BUFFER_SIZE);
+    pc->data_rb = buffer_new(CONFIG_DATA_BUFFER_SIZE);
+#endif
+  }
+
   if (pc->config.audio_codec) {
+#if (CONFIG_AUDIO_BUFFER_SIZE) > 0
+    LOGI("Audio allocates heap size: %d", CONFIG_AUDIO_BUFFER_SIZE);
+    pc->audio_rb = buffer_new(CONFIG_AUDIO_BUFFER_SIZE);
+#endif
+
     rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
                      peer_connection_outgoing_rtp_packet, (void*)pc);
 
@@ -173,6 +189,10 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   }
 
   if (pc->config.video_codec) {
+#if (CONFIG_VIDEO_BUFFER_SIZE) > 0
+    LOGI("Video allocates heap size: %d", CONFIG_VIDEO_BUFFER_SIZE);
+    pc->video_rb = buffer_new(CONFIG_VIDEO_BUFFER_SIZE);
+#endif
     rtp_encoder_init(&pc->vrtp_encoder, pc->config.video_codec,
                      peer_connection_outgoing_rtp_packet, (void*)pc);
 
@@ -188,6 +208,10 @@ void peer_connection_destroy(PeerConnection* pc) {
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
+    buffer_free(pc->data_rb);
+    buffer_free(pc->audio_rb);
+    buffer_free(pc->video_rb);
+
     free(pc);
     pc = NULL;
   }
@@ -202,7 +226,11 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
     // LOGE("dtls_srtp not connected");
     return -1;
   }
+#if (CONFIG_AUDIO_BUFFER_SIZE) > 0
+  return buffer_push_tail(pc->audio_rb, buf, len);
+#else
   return rtp_encoder_encode(&pc->artp_encoder, buf, len);
+#endif
 }
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len) {
@@ -210,11 +238,23 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
     // LOGE("dtls_srtp not connected");
     return -1;
   }
-  return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
+#if (CONFIG_VIDEO_BUFFER_SIZE) > 0
+  return buffer_push_tail(pc->video_rb, buf, len);
+#else
+  return rtp_encoder_encode(&pc->vrtp_encoder, data, bytes);
+#endif
+}
+
+// SpawnWear (Phase 7b): RFC 8832 §6 - the DTLS SERVER must use ODD SCTP stream ids, the DTLS
+// CLIENT even ones. libpeer historically hardcoded sid 0 (only correct when it is the client).
+// The watch is the DTLS server (a=setup:passive), so its single data channel lives on sid 1;
+// using sid 0 made SipSorcery/Chrome drop our DATA as "no channel found for stream 0".
+static inline uint16_t peer_connection_default_dc_sid(PeerConnection* pc) {
+  return pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER ? 1 : 0;
 }
 
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
-  return peer_connection_datachannel_send_sid(pc, message, len, 0);
+  return peer_connection_datachannel_send_sid(pc, message, len, peer_connection_default_dc_sid(pc));
 }
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
@@ -222,14 +262,21 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
     LOGE("sctp not connected");
     return -1;
   }
+
+#if (CONFIG_DATA_BUFFER_SIZE) > 0
+  return buffer_push_tail(pc->data_rb, (uint8_t*)message, len);
+#else
   if (pc->config.datachannel == DATA_CHANNEL_STRING)
     return sctp_outgoing_data(&pc->sctp, message, len, PPID_STRING, sid);
   else
     return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
+#endif
 }
 
 int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol) {
-  return peer_connection_create_datachannel_sid(pc, channel_type, priority, reliability_parameter, label, protocol, 0);
+  // SpawnWear (Phase 7b): pick the DCEP stream-id parity from our DTLS role (RFC 8832 §6) -
+  // server=odd, client=even - instead of always 0. See peer_connection_default_dc_sid above.
+  return peer_connection_create_datachannel_sid(pc, channel_type, priority, reliability_parameter, label, protocol, peer_connection_default_dc_sid(pc));
 }
 
 int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol, uint16_t sid) {
@@ -263,9 +310,6 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   uint16_t label_length = htons(strlen(label));
   uint16_t protocol_length = htons(strlen(protocol));
   char* msg = calloc(1, msg_size);
-  if (!msg) {
-    return rtrn;
-  }
 
   msg[0] = DATA_CHANNEL_OPEN;
   memcpy(msg + 2, &priority_big_endian, sizeof(uint16_t));
@@ -284,13 +328,112 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
 }
 
+static void peer_connection_state_new(PeerConnection* pc, DtlsSrtpRole role, int isOfferer) {
+  char* description = (char*)pc->temp_buf;
+
+  memset(pc->temp_buf, 0, sizeof(pc->temp_buf));
+
+  dtls_srtp_reset_session(&pc->dtls_srtp);
+  dtls_srtp_init(&pc->dtls_srtp, role, pc);
+  pc->dtls_srtp.udp_recv = peer_connection_dtls_srtp_recv;
+  pc->dtls_srtp.udp_send = peer_connection_dtls_srtp_send;
+
+  pc->sctp.connected = 0;
+
+  if (isOfferer) {
+    agent_clear_candidates(&pc->agent);
+    pc->agent.mode = AGENT_MODE_CONTROLLING;
+  } else {
+    pc->agent.mode = AGENT_MODE_CONTROLLED;
+  }
+
+  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
+  for (int i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
+    if (pc->config.ice_servers[i].urls) {
+      LOGI("ice server: %s", pc->config.ice_servers[i].urls);
+      agent_gather_candidate(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username, pc->config.ice_servers[i].credential);
+    }
+  }
+
+  agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
+
+  memset(&pc->local_sdp, 0, sizeof(pc->local_sdp));
+  // TODO: check if we have video or audio codecs
+  sdp_create(&pc->local_sdp,
+             pc->config.video_codec != CODEC_NONE,
+             pc->config.audio_codec != CODEC_NONE,
+             pc->config.datachannel);
+
+  if (pc->config.video_codec == CODEC_H264) {
+    sdp_append_h264(&pc->local_sdp);
+    sdp_append(&pc->local_sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
+    sdp_append(&pc->local_sdp, peer_connection_dtls_role_setup_value(role));
+    sdp_append(&pc->local_sdp, description);
+  }
+
+  switch (pc->config.audio_codec) {
+    case CODEC_PCMA:
+
+      sdp_append_pcma(&pc->local_sdp);
+      sdp_append(&pc->local_sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
+      sdp_append(&pc->local_sdp, peer_connection_dtls_role_setup_value(role));
+      sdp_append(&pc->local_sdp, description);
+      break;
+
+    case CODEC_PCMU:
+
+      sdp_append_pcmu(&pc->local_sdp);
+      sdp_append(&pc->local_sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
+      sdp_append(&pc->local_sdp, peer_connection_dtls_role_setup_value(role));
+      sdp_append(&pc->local_sdp, description);
+      break;
+
+    case CODEC_OPUS:
+      sdp_append_opus(&pc->local_sdp);
+      sdp_append(&pc->local_sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
+      sdp_append(&pc->local_sdp, peer_connection_dtls_role_setup_value(role));
+      sdp_append(&pc->local_sdp, description);
+
+    default:
+      break;
+  }
+
+  if (pc->config.datachannel) {
+    sdp_append_datachannel(&pc->local_sdp);
+    sdp_append(&pc->local_sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
+    sdp_append(&pc->local_sdp, peer_connection_dtls_role_setup_value(role));
+    sdp_append(&pc->local_sdp, description);
+  }
+
+  pc->b_local_description_created = 1;
+
+  if (pc->onicecandidate) {
+    pc->onicecandidate(pc->local_sdp.content, pc->config.user_data);
+  }
+}
+
 int peer_connection_loop(PeerConnection* pc) {
+  int bytes;
+  uint8_t* data = NULL;
   uint32_t ssrc = 0;
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
   switch (pc->state) {
     case PEER_CONNECTION_NEW:
+
+      if (!pc->b_local_description_created) {
+        // SpawnWear (Phase 7c): the watch (offerer) is the DTLS CLIENT (a=setup:active), not server.
+        // Browsers (Chrome/Firefox) send a large DTLS ClientHello that exceeds the DTLS MTU and gets
+        // FRAGMENTED across handshake records; mbedTLS's SERVER refuses to reassemble the initial
+        // ClientHello (ssl_tls12_server.c: "ClientHello fragmentation not supported" ->
+        // FEATURE_UNAVAILABLE). As the CLIENT, the watch sends its own SMALL ClientHello and reads the
+        // peer's flight through mbedTLS's normal read_record path, which DOES reassemble fragments.
+        // The answerer (browser/SipSorcery) becomes the DTLS server (setup:passive). Our role-based
+        // SCTP stream-id (peer_connection_default_dc_sid) auto-switches the data channel to even
+        // stream 0, correct for the DTLS client per RFC 8832 §6.
+        peer_connection_state_new(pc, DTLS_SRTP_ROLE_CLIENT, 1);
+      }
       break;
 
     case PEER_CONNECTION_CHECKING:
@@ -301,9 +444,12 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
 
-    case PEER_CONNECTION_CONNECTED:
-
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+    case PEER_CONNECTION_CONNECTED: {
+      // SpawnWear (Phase 7b): the handshake is now NON-BLOCKING. 0 = done; WANT_READ/WANT_WRITE =
+      // still in progress (retry next loop); anything else = a FATAL DTLS error -> go to FAILED so
+      // we stop re-driving a dead handshake (which otherwise spun this loop forever).
+      int hs = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
+      if (hs == 0) {
         LOGD("DTLS-SRTP handshake done");
 
         if (pc->config.datachannel) {
@@ -313,9 +459,44 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
+      } else if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
       break;
+    }
     case PEER_CONNECTION_COMPLETED:
+
+#if (CONFIG_VIDEO_BUFFER_SIZE) > 0
+      data = buffer_peak_head(pc->video_rb, &bytes);
+      if (data) {
+        rtp_encoder_encode(&pc->vrtp_encoder, data, bytes);
+        buffer_pop_head(pc->video_rb);
+      }
+#endif
+
+#if (CONFIG_AUDIO_BUFFER_SIZE) > 0
+      data = buffer_peak_head(pc->audio_rb, &bytes);
+      if (data) {
+        rtp_encoder_encode(&pc->artp_encoder, data, bytes);
+        buffer_pop_head(pc->audio_rb);
+      }
+#endif
+
+#if (CONFIG_DATA_BUFFER_SIZE) > 0
+      data = buffer_peak_head(pc->data_rb, &bytes);
+      if (data) {
+        // SpawnWear (Phase 7b): the buffered data path (CONFIG_DATA_BUFFER_SIZE>0) is the LIVE send
+        // path and was hardcoding stream 0, defeating the role-based sid. Send on our DTLS-role
+        // stream (RFC 8832 §6: server=odd, client=even) so SipSorcery/Chrome find the channel.
+        uint16_t dc_sid = peer_connection_default_dc_sid(pc);
+        if (pc->config.datachannel == DATA_CHANNEL_STRING)
+          sctp_outgoing_data(&pc->sctp, (char*)data, bytes, PPID_STRING, dc_sid);
+        else
+          sctp_outgoing_data(&pc->sctp, (char*)data, bytes, PPID_BINARY, dc_sid);
+        buffer_pop_head(pc->data_rb);
+      }
+#endif
+
       if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
         LOGD("agent_recv %d", pc->agent_ret);
 
@@ -368,8 +549,8 @@ int peer_connection_loop(PeerConnection* pc) {
   return 0;
 }
 
-void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
-  char* start = (char*)sdp;
+void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp_text) {
+  char* start = (char*)sdp_text;
   char* line = NULL;
   char buf[256];
   char* val_start = NULL;
@@ -415,103 +596,17 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
     return;
   }
 
-  agent_set_remote_description(&pc->agent, (char*)sdp);
-  if (type == SDP_TYPE_ANSWER) {
-    agent_update_candidate_pairs(&pc->agent);
-    STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
-  }
-}
-
-static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_type) {
-  char* description = (char*)pc->temp_buf;
-
-  memset(pc->temp_buf, 0, sizeof(pc->temp_buf));
-  DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
-
-  pc->sctp.connected = 0;
-
-  switch (sdp_type) {
-    case SDP_TYPE_OFFER:
-      role = DTLS_SRTP_ROLE_SERVER;
-      agent_clear_candidates(&pc->agent);
-      pc->agent.mode = AGENT_MODE_CONTROLLING;
-      break;
-    case SDP_TYPE_ANSWER:
-      role = DTLS_SRTP_ROLE_CLIENT;
-      pc->agent.mode = AGENT_MODE_CONTROLLED;
-      break;
-    default:
-      break;
+  if (!pc->b_local_description_created) {
+    peer_connection_state_new(pc, role, 0);
   }
 
-  dtls_srtp_reset_session(&pc->dtls_srtp);
-  dtls_srtp_init(&pc->dtls_srtp, role, pc);
-  pc->dtls_srtp.udp_recv = peer_connection_dtls_srtp_recv;
-  pc->dtls_srtp.udp_send = peer_connection_dtls_srtp_send;
-
-  memset(pc->sdp, 0, sizeof(pc->sdp));
-  // TODO: check if we have video or audio codecs
-  sdp_create(pc->sdp,
-             pc->config.video_codec != CODEC_NONE,
-             pc->config.audio_codec != CODEC_NONE,
-             pc->config.datachannel);
-
-  agent_create_ice_credential(&pc->agent);
-  sdp_append(pc->sdp, "a=ice-ufrag:%s", pc->agent.local_ufrag);
-  sdp_append(pc->sdp, "a=ice-pwd:%s", pc->agent.local_upwd);
-  sdp_append(pc->sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
-  sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
-
-  if (pc->config.video_codec == CODEC_H264) {
-    sdp_append_h264(pc->sdp);
-  }
-
-  switch (pc->config.audio_codec) {
-    case CODEC_PCMA:
-      sdp_append_pcma(pc->sdp);
-      break;
-    case CODEC_PCMU:
-      sdp_append_pcmu(pc->sdp);
-      break;
-    case CODEC_OPUS:
-      sdp_append_opus(pc->sdp);
-    default:
-      break;
-  }
-
-  if (pc->config.datachannel) {
-    sdp_append_datachannel(pc->sdp);
-  }
-
-  pc->b_local_description_created = 1;
-
-  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
-  for (int i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
-    if (pc->config.ice_servers[i].urls) {
-      LOGI("ice server: %s", pc->config.ice_servers[i].urls);
-      agent_gather_candidate(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username, pc->config.ice_servers[i].credential);
-    }
-  }
-
-  agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
-  sdp_append(pc->sdp, description);
-
-  if (pc->onicecandidate) {
-    pc->onicecandidate(pc->sdp, pc->config.user_data);
-  }
-
-  return pc->sdp;
-}
-
-const char* peer_connection_create_offer(PeerConnection* pc) {
-  return peer_connection_create_sdp(pc, SDP_TYPE_OFFER);
-}
-
-const char* peer_connection_create_answer(PeerConnection* pc) {
-  const char* sdp = peer_connection_create_sdp(pc, SDP_TYPE_ANSWER);
-  agent_update_candidate_pairs(&pc->agent);
+  agent_set_remote_description(&pc->agent, (char*)sdp_text);
   STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
-  return sdp;
+}
+
+void peer_connection_create_offer(PeerConnection* pc) {
+  STATE_CHANGED(pc, PEER_CONNECTION_NEW);
+  pc->b_local_description_created = 0;
 }
 
 int peer_connection_send_rtcp_pil(PeerConnection* pc, uint32_t ssrc) {
@@ -537,7 +632,7 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
 }
 
-void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {
+void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp_text, void* userdata)) {
   pc->onicecandidate = onicecandidate;
 }
 
@@ -581,7 +676,7 @@ int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
   if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], candidate, candidate + strlen(candidate)) != 0) {
     return -1;
   }
-  LOGD("Add candidate: %s", candidate);
+
   agent->remote_candidates_count++;
   return 0;
 }

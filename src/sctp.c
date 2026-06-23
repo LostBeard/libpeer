@@ -124,7 +124,11 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
 
   chunk->type = SCTP_DATA;
   chunk->iube = 0x06;
-  chunk->sid = htons(0);
+  // SpawnWear (Phase 7b): honor the caller's stream id instead of hardcoding 0. The manual SCTP
+  // path (this build doesn't use usrsctp - INIT tag 0x12345678 confirms) was pinning every DATA
+  // chunk to stream 0, so our DTLS-server data channel (which must live on an ODD stream per
+  // RFC 8832 §6) was emitted on stream 0 and SipSorcery/Chrome dropped it ("no channel for sid 0").
+  chunk->sid = htons(sid);
   chunk->sqn = htons(sqn++);
   chunk->ppid = htonl(ppid);
 
@@ -271,7 +275,14 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
           data_chunk->length = htons(1 + sizeof(SctpDataChunk));
           data_chunk->data[0] = DATA_CHANNEL_ACK;
           length += ntohs(data_chunk->length);
-        } else if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING || ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY) {
+        } else if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING ||
+                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY ||
+                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING_PARTIAL ||
+                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY_PARTIAL) {
+          // SpawnWear (Phase 7c): the manual SCTP path only delivered DOMSTRING to onmessage, so
+          // every BINARY data-channel message (the WebRtcChallenge nonces/responses, and all app
+          // data) was silently dropped on RECEIVE - the watch had only ever SENT before. Deliver
+          // BINARY (+ the partial variants) too. usrsctp's sctp_handle_incoming_data already does.
           if (sctp->onmessage) {
             sctp->onmessage((char*)data_chunk->data, ntohs(data_chunk->length) - sizeof(SctpDataChunk),
                             sctp->userdata, ntohs(data_chunk->sid));
@@ -302,6 +313,13 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         param->length = htons(8);
         *(uint32_t*)&param->value = htonl(0x02);
         length = ntohs(init_ack->common.length) + sizeof(SctpHeader);
+
+        if (!sctp->connected) {
+          sctp->connected = 1;
+          if (sctp->onopen) {
+            sctp->onopen(sctp->userdata);
+          }
+        }
       } break;
       case SCTP_INIT_ACK: {
         SctpInitChunk* init_ack = (SctpInitChunk*)in_packet->chunks;
@@ -328,6 +346,13 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         // param: type + length (4 bytes) + cookie
         memcpy(cookie_echo->cookie, param->value, ntohs(param->length) - 4);
         length = ntohs(cookie_echo->common.length) + sizeof(SctpHeader);
+
+        if (!sctp->connected) {
+          sctp->connected = 1;
+          if (sctp->onopen) {
+            sctp->onopen(sctp->userdata);
+          }
+        }
       } break;
       case SCTP_SACK:
 #if 0
@@ -368,20 +393,8 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         common->length = htons(4);
         length = ntohs(common->length) + sizeof(SctpHeader);
         pos = len;  // Do not handle other msg
-        if (!sctp->connected) {
-          sctp->connected = 1;
-          if (sctp->onopen) {
-            sctp->onopen(sctp->userdata);
-          }
-        }
       } break;
       case SCTP_COOKIE_ACK: {
-        if (!sctp->connected) {
-          sctp->connected = 1;
-          if (sctp->onopen) {
-            sctp->onopen(sctp->userdata);
-          }
-        }
         break;
       }
       case SCTP_ABORT:
@@ -490,18 +503,6 @@ static int sctp_incoming_data_cb(struct socket* sock, union sctp_sockstore addr,
 }
 #endif
 
-void sctp_usrsctp_init() {
-#if CONFIG_USE_USRSCTP
-  usrsctp_init(0, sctp_outgoing_data_cb, NULL);
-#endif
-}
-
-void sctp_usrsctp_deinit() {
-#if CONFIG_USE_USRSCTP
-  usrsctp_finish();
-#endif
-}
-
 int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->dtls_srtp = dtls_srtp;
   sctp->local_port = 5000;
@@ -509,6 +510,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->tsn = 1234;
 #if CONFIG_USE_USRSCTP
   int ret = -1;
+  usrsctp_init(0, sctp_outgoing_data_cb, NULL);
   usrsctp_sysctl_set_sctp_ecn_enable(0);
   usrsctp_register_address(sctp);
 
@@ -637,6 +639,7 @@ void sctp_destroy_association(Sctp* sctp) {
   if (sctp && sctp->sock) {
     usrsctp_shutdown(sctp->sock, SHUT_RDWR);
     usrsctp_close(sctp->sock);
+    usrsctp_finish();
     sctp->sock = NULL;
   }
 #endif

@@ -10,20 +10,25 @@
 #define ICE_LITE 0
 #endif
 
-void sdp_append_h264(char* sdp);
+typedef struct Sdp {
+  char content[CONFIG_SDP_BUFFER_SIZE];
 
-void sdp_append_pcma(char* sdp);
+} Sdp;
 
-void sdp_append_pcmu(char* sdp);
+void sdp_append_h264(Sdp* sdp);
 
-void sdp_append_opus(char* sdp);
+void sdp_append_pcma(Sdp* sdp);
 
-void sdp_append_datachannel(char* sdp);
+void sdp_append_pcmu(Sdp* sdp);
 
-void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel);
+void sdp_append_opus(Sdp* sdp);
 
-int sdp_append(char* sdp, const char* format, ...);
+void sdp_append_datachannel(Sdp* sdp);
 
-void sdp_reset(char* sdp);
+void sdp_create(Sdp* sdp, int b_video, int b_audio, int b_datachannel);
+
+int sdp_append(Sdp* sdp, const char* format, ...);
+
+void sdp_reset(Sdp* sdp);
 
 #endif  // SDP_H_

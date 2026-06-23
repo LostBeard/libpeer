@@ -40,8 +40,6 @@ int agent_create(Agent* agent) {
 #endif
 
   agent_clear_candidates(agent);
-  memset(agent->remote_ufrag, 0, sizeof(agent->remote_ufrag));
-  memset(agent->remote_upwd, 0, sizeof(agent->remote_upwd));
   return 0;
 }
 
@@ -281,15 +279,16 @@ void agent_gather_candidate(Agent* agent, const char* urls, const char* username
   }
 }
 
-void agent_create_ice_credential(Agent* agent) {
+void agent_get_local_description(Agent* agent, char* description, int length) {
+  memset(description, 0, length);
   memset(agent->local_ufrag, 0, sizeof(agent->local_ufrag));
   memset(agent->local_upwd, 0, sizeof(agent->local_upwd));
 
   utils_random_string(agent->local_ufrag, 4);
   utils_random_string(agent->local_upwd, 24);
-}
 
-void agent_get_local_description(Agent* agent, char* description, int length) {
+  snprintf(description, length, "a=ice-ufrag:%s\r\na=ice-pwd:%s\r\n", agent->local_ufrag, agent->local_upwd);
+
   for (int i = 0; i < agent->local_candidates_count; i++) {
     ice_candidate_to_description(&agent->local_candidates[i], description + strlen(description), length - strlen(description));
   }
@@ -400,7 +399,7 @@ void agent_set_remote_description(Agent* agent, char* description) {
   a=ice-pwd:IexbSoY7JulyMbjKwISsG9
   a=candidate:1 1 UDP 1 36.231.28.50 38143 typ srflx
   */
-  int i;
+  int i, j;
 
   LOGD("Set remote description:\n%s", description);
 
@@ -432,10 +431,7 @@ void agent_set_remote_description(Agent* agent, char* description) {
 
   LOGD("remote ufrag: %s", agent->remote_ufrag);
   LOGD("remote upwd: %s", agent->remote_upwd);
-}
 
-void agent_update_candidate_pairs(Agent* agent) {
-  int i, j;
   // Please set gather candidates before set remote description
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {

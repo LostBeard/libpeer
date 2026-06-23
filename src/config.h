@@ -2,7 +2,12 @@
 #define CONFIG_H_
 
 // uncomment this if you want to handshake with a aiortc
-// #define CONFIG_DTLS_USE_ECDSA 1
+// SpawnWear (Phase 7b 2026-06-23): ENABLED. The watch is the DTLS SERVER answering SipSorcery
+// (ECDSA P-256 cert), which offers ONLY ECDHE-ECDSA ciphersuites. With this 0 (RSA cert), the
+// watch found the common suite but mbedtls_pk_can_do(RSA_key, ECDSA) failed in ssl_pick_cert
+// -> 0x30041 -> "no usable ciphersuite" -> handshake_failure(40)/-0x6E00 at CLIENT_HELLO (state=1).
+// ECDSA P-256 is the WebRTC standard (Chrome/Firefox/aiortc/SipSorcery) and cheap on ESP32.
+#define CONFIG_DTLS_USE_ECDSA 1
 
 #define SCTP_MTU (1200)
 #define CONFIG_MTU (1300)
@@ -33,6 +38,18 @@
 #define CONFIG_USE_USRSCTP 1
 #endif
 
+#ifndef CONFIG_VIDEO_BUFFER_SIZE
+#define CONFIG_VIDEO_BUFFER_SIZE (CONFIG_MTU * 256)
+#endif
+
+#ifndef CONFIG_AUDIO_BUFFER_SIZE
+#define CONFIG_AUDIO_BUFFER_SIZE (CONFIG_MTU * 256)
+#endif
+
+#ifndef CONFIG_DATA_BUFFER_SIZE
+#define CONFIG_DATA_BUFFER_SIZE (SCTP_MTU * 128)
+#endif
+
 #ifndef CONFIG_SDP_BUFFER_SIZE
 #define CONFIG_SDP_BUFFER_SIZE 8096
 #endif
@@ -57,18 +74,12 @@
 #define CONFIG_AUDIO_DURATION 20
 #endif
 
-#ifndef CONFIG_MAX_NALU_SIZE
-#define CONFIG_MAX_NALU_SIZE (10 * 1024)  // 10KB
-#endif
-
 #define CONFIG_IPV6 0
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
 
 // #define LOG_LEVEL LEVEL_DEBUG
-#ifndef LOG_REDIRECT
 #define LOG_REDIRECT 0
-#endif
 
 // Disable MQTT and HTTP signaling
 // #define DISABLE_PEER_SIGNALING 1

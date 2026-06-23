@@ -1,6 +1,7 @@
 #ifndef SCTP_H_
 #define SCTP_H_
 
+#include "buffer.h"
 #include "config.h"
 #include "dtls_srtp.h"
 #include "utils.h"
@@ -156,6 +157,7 @@ typedef struct Sctp {
   uint32_t verification_tag;
   uint32_t tsn;
   DtlsSrtp* dtls_srtp;
+  Buffer** data_rb;
   int stream_count;
   SctpStreamEntry stream_table[SCTP_MAX_STREAMS];
 
@@ -171,10 +173,6 @@ typedef struct Sctp {
 int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp);
 
 void sctp_destroy_association(Sctp* sctp);
-
-void sctp_usrsctp_init();
-
-void sctp_usrsctp_deinit();
 
 int sctp_is_connected(Sctp* sctp);
 

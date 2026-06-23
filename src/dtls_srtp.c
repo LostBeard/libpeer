@@ -9,6 +9,7 @@
 #if CONFIG_MBEDTLS_DEBUG
 #include "mbedtls/debug.h"
 #endif
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS  // SpawnWear 7b: read ssl.state to name the failing handshake step
 #include "mbedtls/sha256.h"
 #include "mbedtls/ssl.h"
 #include "ports.h"
@@ -26,17 +27,57 @@ int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   return ret;
 }
 
+#include "esp_attr.h"
+// SpawnWear (Phase 7b) DTLS crash localization: a checkpoint in RTC noinit memory that SURVIVES
+// the soft-reset reboot, so we can read where the handshake died via the interop GetState(-1).
+// 1=handshake entered, 2=key derivation (SRTP) entered, 4=handshake fully returned (DTLS ok).
+// Remove once the crash is root-caused.
+RTC_NOINIT_ATTR volatile uint32_t g_sw_dtls_cp;
+
 int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
 
   int ret;
+  // SpawnWear (Phase 7b): the original loop spun FOREVER waiting for DTLS data, which froze the
+  // watch (the caller holds a mutex across peer_connection_loop). Bound it so the loop yields.
+  int spins = 0;
 
   while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
     ports_sleep_ms(1);
+    if (++spins >= 2000) {  // ~2s safety cap
+      return MBEDTLS_ERR_SSL_WANT_READ;  // SpawnWear: WANT_READ (poll), NOT TIMEOUT - TIMEOUT makes
+                                         // mbedtls retransmit a not-yet-built flight (NULL deref crash)
+    }
   }
 
   LOGD("dtls_srtp_udp_recv (%d)", ret);
+
+  return ret;
+}
+
+// SpawnWear (Phase 7b): a timeout-aware recv for mbedtls' DTLS BIO. The DTLS retransmission timer
+// is configured (mbedtls_ssl_set_timer_cb) but libpeer passed f_recv_timeout=NULL, so mbedtls
+// could never time out to retransmit a lost flight - the handshake would hang forever. Wiring
+// this as f_recv_timeout lets mbedtls drive retransmission and bounds each blocking wait.
+int dtls_srtp_udp_recv_timeout(void* ctx, uint8_t* buf, size_t len, uint32_t timeout) {
+  DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+  UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
+
+  int ret;
+  uint32_t waited = 0;
+  if (timeout == 0) {
+    timeout = 1000;
+  }
+
+  while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
+    ports_sleep_ms(5);
+    waited += 5;
+    if (waited >= timeout) {
+      return MBEDTLS_ERR_SSL_WANT_READ;  // SpawnWear: WANT_READ (poll), NOT TIMEOUT - TIMEOUT makes
+                                         // mbedtls retransmit a not-yet-built flight (NULL deref crash)
+    }
+  }
 
   return ret;
 }
@@ -142,6 +183,19 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
 #if CONFIG_MBEDTLS_DEBUG
 static void dtls_srtp_debug(void* ctx, int level, const char* file, int line, const char* str) {
   LOGD("%s:%04d: %s", file, line, str);
+  // SpawnWear (Phase 7b) diag: encode the reason for an important (level<=1) mbedtls message into
+  // the RTC checkpoint, read via GetState(-1) / /webrtc-checkpoint as 0x2000X. Remove once stable.
+  if (level <= 1 && str != NULL) {
+    if (strstr(str, "ciphersuite")) g_sw_dtls_cp = 0x20001;
+    else if (strstr(str, "curve")) g_sw_dtls_cp = 0x20002;
+    else if (strstr(str, "version")) g_sw_dtls_cp = 0x20003;
+    else if (strstr(str, "ignature") || strstr(str, "sig_alg") || strstr(str, "sig alg")) g_sw_dtls_cp = 0x20004;
+    else if (strstr(str, "ertificate")) g_sw_dtls_cp = 0x20005;
+    else if (strstr(str, "cookie")) g_sw_dtls_cp = 0x20006;
+    else if (strstr(str, "ragment")) g_sw_dtls_cp = 0x20007;
+    else if (strstr(str, "alert")) g_sw_dtls_cp = 0x20008;
+    else g_sw_dtls_cp = 0x2F000 | ((unsigned int)(str[0]) & 0xFF);  // unmatched: first char as a hint
+  }
 }
 #endif
 
@@ -194,7 +248,10 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
     mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
 
-    mbedtls_ssl_conf_dtls_cookies(&dtls_srtp->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check, &dtls_srtp->cookie_ctx);
+    // SpawnWear (Phase 7b): DISABLE DTLS cookies (HelloVerifyRequest). The peer is paired/known
+    // (no DoS-amplification concern over the hub), and dropping the cookie removes the
+    // session_reset retry loop, which is what makes the server handshake non-blockable.
+    mbedtls_ssl_conf_dtls_cookies(&dtls_srtp->conf, NULL, NULL, NULL);
 
   } else {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,
@@ -214,6 +271,13 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   mbedtls_ssl_conf_cert_req_ca_list(&dtls_srtp->conf, MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
 
   mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
+
+  // SpawnWear (Phase 7c): as the DTLS CLIENT (verifying the peer's cert), mbedTLS 3.6+ refuses to
+  // proceed unless mbedtls_ssl_set_hostname() was called explicitly, returning
+  // MBEDTLS_ERR_SSL_CERTIFICATE_VERIFICATION_WITHOUT_HOSTNAME (-0x5D80) at SERVER_CERTIFICATE. WebRTC
+  // has no hostname - identity is the cert FINGERPRINT (checked in dtls_srtp_handshake) - so opt out
+  // explicitly with NULL. Harmless for the server role.
+  mbedtls_ssl_set_hostname(&dtls_srtp->ssl, NULL);
 
   return 0;
 }
@@ -241,6 +305,7 @@ static int dtls_srtp_key_derivation(DtlsSrtp* dtls_srtp, const unsigned char* ma
   int ret;
   const char* dtls_srtp_label = "EXTRACTOR-dtls_srtp";
   uint8_t key_material[DTLS_SRTP_KEY_MATERIAL_LENGTH];
+  g_sw_dtls_cp = 2;  // SpawnWear: DTLS crypto done, deriving SRTP keys (srtp_create follows)
   // Export keying material
   if ((ret = mbedtls_ssl_tls_prf(tls_prf_type, master_secret, secret_len, dtls_srtp_label,
                                  randbytes, randbytes_len, key_material, sizeof(key_material))) != 0) {
@@ -379,55 +444,39 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
+  // SpawnWear (Phase 7b): f_recv_timeout MUST stay NULL so mbedtls uses dtls_srtp->udp_recv
+  // (= peer_connection_dtls_srtp_recv, which reads via agent_recv = the ICE-aware demuxing read
+  // that also keeps ICE alive). An earlier attempt set a custom f_recv_timeout here that read the
+  // wrong socket (user_data is a PeerConnection*, not a UdpSocket) - the watch never saw the
+  // ClientHello. peer_connection_dtls_srtp_recv is now non-blocking (returns WANT_READ).
   mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
 
-  do {
-    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  // SpawnWear (Phase 7b): NON-BLOCKING - call once and return WANT_READ/WANT_WRITE up to
+  // peer_connection_loop (the original do-while spun here, holding the pump mutex => froze the
+  // watch). mbedtls keeps the handshake state in ssl across calls; the timer above is static.
+  ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
 
   return ret;
 }
 
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  while (1) {
-    unsigned char client_ip[] = "test";
-
-    mbedtls_ssl_session_reset(&dtls_srtp->ssl);
-
-    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
-
-    ret = dtls_srtp_do_handshake(dtls_srtp);
-
-    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-      LOGD("DTLS hello verification requested");
-
-    } else if (ret != 0) {
-      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
-
-      break;
-
-    } else {
-      break;
-    }
-  }
-
-  LOGD("DTLS server handshake done");
-
-  return ret;
+  // SpawnWear (Phase 7b): NON-BLOCKING + DTLS cookies disabled (see dtls_srtp_init), so there is
+  // no HelloVerifyRequest and no session_reset retry loop - just drive one handshake step. The
+  // original while(1) + mbedtls_ssl_session_reset() assumed a blocking recv and RESET the
+  // handshake on every peer_connection_loop iteration, so a non-blocking handshake could never
+  // make progress. WANT_READ/WANT_WRITE propagate up; mbedtls keeps its own handshake state.
+  return dtls_srtp_do_handshake(dtls_srtp);
 }
 
 static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
   int ret;
 
   ret = dtls_srtp_do_handshake(dtls_srtp);
-  if (ret != 0) {
+  // SpawnWear (Phase 7c): the handshake is non-blocking, so WANT_READ/WANT_WRITE are NORMAL
+  // (the client steps the handshake across many peer_connection_loop calls). Only log a real error.
+  if (ret != 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
     LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
   }
-
-  LOGD("DTLS client handshake done");
 
   return ret;
 }
@@ -435,11 +484,31 @@ static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   int ret;
   dtls_srtp->remote_addr = addr;
+  g_sw_dtls_cp = 1;  // SpawnWear: DTLS handshake entered
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     ret = dtls_srtp_handshake_server(dtls_srtp);
   } else {
     ret = dtls_srtp_handshake_client(dtls_srtp);
+  }
+
+  // SpawnWear (Phase 7b): NON-BLOCKING - if the handshake isn't complete yet (WANT_READ /
+  // WANT_WRITE) or it errored, return now. The fingerprint check below dereferences the peer
+  // cert, which only exists once the handshake is DONE (ret == 0); running it mid-handshake
+  // returned -1 ("no remote fingerprint"). peer_connection_loop re-enters next iteration.
+  if (ret != 0) {
+    // not complete yet (WANT_READ) or a fatal error; peer_connection_loop re-enters. Record the
+    // mbedtls error magnitude (read via GetState(-1) as 0x10000|err) UNLESS an in-mbedtls
+    // instrumentation point already set a 0x3xxxx reason code.
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && g_sw_dtls_cp < 0x30000u) {
+      // SpawnWear 7b: pack the mbedtls handshake state alongside the error magnitude so we can name
+      // WHICH step failed. Value = 0x40_SS_EEEE (top byte 0x40 = marker, SS = ssl.state, EEEE = -ret).
+      // state enum: 2=ServerHello 3=ServerCert 4=ServerKeyExchange 7=ClientCert 8=ClientKeyExchange
+      // 9=CertVerify 13=ServerFinished. (e.g. 0x40086E00 = ClientKeyExchange + HANDSHAKE_FAILURE)
+      unsigned int st = (unsigned int)dtls_srtp->ssl.MBEDTLS_PRIVATE(state) & 0xFFu;
+      g_sw_dtls_cp = (0x40u << 24) | (st << 16) | ((unsigned int)(-ret) & 0xFFFFu);
+    }
+    return ret;
   }
 
   const mbedtls_x509_crt* remote_crt;
@@ -461,6 +530,7 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
   mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
 
+  g_sw_dtls_cp = 4;  // SpawnWear: DTLS handshake fully returned (crypto + SRTP + fingerprint ok)
   return ret;
 }
 
