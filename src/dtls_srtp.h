@@ -57,6 +57,11 @@ typedef struct DtlsSrtp {
 
   int (*udp_send)(void* ctx, const unsigned char* buf, size_t len);
   int (*udp_recv)(void* ctx, unsigned char* buf, size_t len);
+  // SpawnWear (watch-answers-offers): f_recv_timeout for mbedtls. Returns MBEDTLS_ERR_SSL_TIMEOUT (not
+  // WANT_READ) when no DTLS data is ready, so mbedtls' timer-driven DTLS RETRANSMISSION engages - the
+  // watch-as-ANSWERER sends its ClientHello before the peer's DTLS transport is up (peer drops it), so it
+  // MUST retransmit. Safe now the watch is always a DTLS CLIENT (its ClientHello flight is built first).
+  int (*udp_recv_timeout)(void* ctx, unsigned char* buf, size_t len, uint32_t timeout);
 
   Address* remote_addr;
 

@@ -39,6 +39,7 @@ struct PeerConnection {
   uint8_t agent_buf[CONFIG_MTU];
   int agent_ret;
   int b_local_description_created;
+  uint32_t dtls_start_ms;  // SpawnWear: ms when ICE reached CONNECTED, to delay the ANSWERER's ClientHello
 
   Buffer* audio_rb;
   Buffer* video_rb;
@@ -78,6 +79,32 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return ret;
   }
   return MBEDTLS_ERR_SSL_WANT_READ;
+}
+
+// SpawnWear (watch-answers-offers): f_recv_timeout for mbedtls. Identical ICE-aware read to
+// peer_connection_dtls_srtp_recv, but returns MBEDTLS_ERR_SSL_TIMEOUT (not WANT_READ) when there's no
+// DTLS data. TIMEOUT lets mbedtls' DTLS RETRANSMISSION fire: as the ANSWERER the watch sends its
+// ClientHello before the peer's DTLS transport is ready (the peer logs "no DTLS transport available" and
+// drops it), so the handshake hangs forever unless the watch RESENDS. With f_recv_timeout=NULL +
+// WANT_READ, mbedtls never retransmitted. Still NON-BLOCKING (one agent_recv) so it never holds the pump
+// mutex; mbedtls' static timer (set in dtls_srtp_do_handshake) governs the actual ~1s resend cadence
+// regardless of how fast we return. Safe now the watch is always a DTLS CLIENT (ClientHello built first).
+static int peer_connection_dtls_srtp_recv_timeout(void* ctx, unsigned char* buf, size_t len, uint32_t timeout) {
+  (void)timeout;
+  int ret = -1;
+  DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+  PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+
+  if (pc->agent_ret > 0 && pc->agent_ret <= len) {
+    memcpy(buf, pc->agent_buf, pc->agent_ret);
+    return pc->agent_ret;
+  }
+
+  ret = agent_recv(&pc->agent, buf, len);
+  if (ret > 0) {
+    return ret;
+  }
+  return MBEDTLS_ERR_SSL_TIMEOUT;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -164,7 +191,15 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memcpy(&pc->config, config, sizeof(PeerConfiguration));
 
-  agent_create(&pc->agent);
+  // SpawnWear (2026-06-30): agent_create opens the UDP socket; if the lwIP pool/heap is exhausted it
+  // FAILS. Upstream ignored the return, so the PC was built with a dead socket and announced offers
+  // that could never ICE-connect (masking the real socket/heap leak as a mystery "no ICE" timeout).
+  // Fail loudly instead so exhaustion surfaces as a create failure, not a silent dead connection.
+  if (agent_create(&pc->agent) < 0) {
+    LOGE("agent_create failed (socket pool/heap exhausted?)");
+    free(pc);
+    return NULL;
+  }
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
@@ -336,6 +371,7 @@ static void peer_connection_state_new(PeerConnection* pc, DtlsSrtpRole role, int
   dtls_srtp_reset_session(&pc->dtls_srtp);
   dtls_srtp_init(&pc->dtls_srtp, role, pc);
   pc->dtls_srtp.udp_recv = peer_connection_dtls_srtp_recv;
+  pc->dtls_srtp.udp_recv_timeout = peer_connection_dtls_srtp_recv_timeout;
   pc->dtls_srtp.udp_send = peer_connection_dtls_srtp_send;
 
   pc->sctp.connected = 0;
@@ -440,11 +476,27 @@ int peer_connection_loop(PeerConnection* pc) {
       if (agent_select_candidate_pair(&pc->agent) < 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       } else if (agent_connectivity_check(&pc->agent) == 0) {
+        pc->dtls_start_ms = ports_get_epoch_time();  // SpawnWear: mark ICE-connected for the answerer DTLS delay
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
       break;
 
     case PEER_CONNECTION_CONNECTED: {
+      // SpawnWear (watch-answers-offers): DELAY the ANSWERER's DTLS start. As the answerer (ICE CONTROLLED)
+      // the watch reaches CONNECTED ~3s BEFORE the peer (offerer) finishes ICE + brings up its DTLS server,
+      // so an immediately-sent ClientHello is DROPPED ("no DTLS transport available") and - with no working
+      // non-blocking retransmission - the handshake hangs. Holding off the ClientHello until the peer is up
+      // sidesteps that. The OFFERER (CONTROLLING) never delays: its peer (answerer) has DTLS ready first, so
+      // its ClientHello lands immediately (the proven offer path). The managed StateCompleted wait (15s)
+      // tolerates the hold.
+      if (pc->agent.mode == AGENT_MODE_CONTROLLED &&
+          (ports_get_epoch_time() - pc->dtls_start_ms) < 3500) {
+        // Keep ICE alive during the hold (respond to the peer's binding requests); in CONNECTED the only
+        // place STUN is serviced is the DTLS recv, which we're deferring - so pump the agent directly here.
+        // Don't start DTLS yet (no ClientHello until the peer's DTLS server is up).
+        agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf));
+        break;
+      }
       // SpawnWear (Phase 7b): the handshake is now NON-BLOCKING. 0 = done; WANT_READ/WANT_WRITE =
       // still in progress (retry next loop); anything else = a FATAL DTLS error -> go to FAILED so
       // we stop re-driving a dead handshake (which otherwise spun this loop forever).
@@ -459,7 +511,12 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
-      } else if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE) {
+      } else if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE && hs != MBEDTLS_ERR_SSL_TIMEOUT) {
+        // SpawnWear (watch-answers-offers): MBEDTLS_ERR_SSL_TIMEOUT is NOT fatal - it means a DTLS read
+        // window elapsed with no data (our f_recv_timeout returns it). Keep retrying (stay CONNECTED) so
+        // mbedtls' retransmission timer fires and RESENDS the flight (the answerer's ClientHello, which
+        // the peer dropped because its DTLS transport wasn't up yet). The managed StateCompleted wait
+        // bounds the overall retry window, so a genuinely dead handshake still gives up there.
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
       break;
@@ -555,7 +612,13 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp_
   char buf[256];
   char* val_start = NULL;
   uint32_t* ssrc = NULL;
-  DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
+  // SpawnWear (watch-answers-offers): the answerer defaults to DTLS CLIENT, not SERVER. A browser offers
+  // "a=setup:actpass" (RFC 5763); the answerer then picks active=CLIENT so the watch sends its own SMALL
+  // ClientHello (mbedTLS as SERVER can't reassemble a browser's FRAGMENTED ClientHello - the wall that
+  // forced the watch offerer-only). Only an explicit "a=setup:active" offer makes us SERVER (below). Net:
+  // the watch is ALWAYS the DTLS client. This is a NO-OP in the offerer path (b_local_description_created
+  // is already true there, so the role-set below is skipped); it only fires when the watch ANSWERS.
+  DtlsSrtpRole role = DTLS_SRTP_ROLE_CLIENT;
   int is_update = 0;
   Agent* agent = &pc->agent;
 
@@ -564,8 +627,11 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp_
     strncpy(buf, start, line - start);
     buf[line - start] = '\0';
 
-    if (strstr(buf, "a=setup:passive")) {
-      role = DTLS_SRTP_ROLE_CLIENT;
+    // Offerer explicitly active -> the answerer MUST be passive (DTLS server). "a=setup:actpass" and
+    // "a=setup:passive" both leave us CLIENT (the default above) - what browsers/SipSorcery send.
+    // ("a=setup:active" is NOT a substring of "a=setup:actpass", so actpass stays CLIENT.)
+    if (strstr(buf, "a=setup:active")) {
+      role = DTLS_SRTP_ROLE_SERVER;
     }
 
     if (strstr(buf, "a=fingerprint")) {

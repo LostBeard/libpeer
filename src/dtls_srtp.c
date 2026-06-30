@@ -444,11 +444,12 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
-  // SpawnWear (Phase 7b): f_recv_timeout MUST stay NULL so mbedtls uses dtls_srtp->udp_recv
-  // (= peer_connection_dtls_srtp_recv, which reads via agent_recv = the ICE-aware demuxing read
-  // that also keeps ICE alive). An earlier attempt set a custom f_recv_timeout here that read the
-  // wrong socket (user_data is a PeerConnection*, not a UdpSocket) - the watch never saw the
-  // ClientHello. peer_connection_dtls_srtp_recv is now non-blocking (returns WANT_READ).
+  // SpawnWear (watch-answers-offers): f_recv_timeout stays NULL. Wiring a non-blocking f_recv_timeout that
+  // returns MBEDTLS_ERR_SSL_TIMEOUT made mbedtls BUSY-WAIT (re-call it for the full ~1s retransmission
+  // timeout) holding the pump mutex -> ~2s cooperative-CLR FREEZE that regressed even the offer path. The
+  // non-blocking pump can't satisfy a blocking f_recv_timeout. Instead the ANSWERER's dropped-ClientHello
+  // timing is handled by DELAYING its DTLS start (peer_connection_loop CONNECTED) until the peer's DTLS is
+  // up - no retransmission needed. (udp_recv_timeout left wired in state_new but unused = harmless.)
   mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
 
   // SpawnWear (Phase 7b): NON-BLOCKING - call once and return WANT_READ/WANT_WRITE up to
