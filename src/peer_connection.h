@@ -108,6 +108,13 @@ int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t l
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid);
 
+/**
+ * @brief send a message on a stream immediately, without copying it into the data ring (SpawnDev).
+ * Call only from the thread that runs peer_connection_loop (or holding the same lock).
+ * @return bytes sent, or -1 when SCTP is not connected
+ */
+int peer_connection_datachannel_send_sid_direct(PeerConnection* pc, char* message, size_t len, uint16_t sid);
+
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);

@@ -292,6 +292,16 @@ int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t l
   return peer_connection_datachannel_send_sid(pc, message, len, peer_connection_default_dc_sid(pc));
 }
 
+int peer_connection_datachannel_send_sid_direct(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
+  // SpawnDev: sends immediately, bypassing the data ring (no copy). Call ONLY from the thread that runs
+  // peer_connection_loop (or with the same lock held), since SCTP/DTLS state is not thread safe.
+  if (!sctp_is_connected(&pc->sctp))
+    return -1;
+  if (pc->config.datachannel == DATA_CHANNEL_STRING)
+    return sctp_outgoing_data(&pc->sctp, message, len, PPID_STRING, sid);
+  return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
+}
+
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
   if (!sctp_is_connected(&pc->sctp)) {
     LOGE("sctp not connected");
@@ -299,7 +309,17 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
   }
 
 #if (CONFIG_DATA_BUFFER_SIZE) > 0
-  return buffer_push_tail(pc->data_rb, (uint8_t*)message, len);
+  // SpawnDev: keep the stream id with the message. The ring used to hold only the payload and the drain sent
+  // everything on the default stream, so a second data channel could never receive anything.
+  uint8_t* entry = (uint8_t*)malloc(len + 2);
+  if (!entry)
+    return -1;
+  entry[0] = (uint8_t)(sid & 0xff);
+  entry[1] = (uint8_t)(sid >> 8);
+  memcpy(entry + 2, message, len);
+  int pushed = buffer_push_tail(pc->data_rb, entry, (int)len + 2);
+  free(entry);
+  return pushed;
 #else
   if (pc->config.datachannel == DATA_CHANNEL_STRING)
     return sctp_outgoing_data(&pc->sctp, message, len, PPID_STRING, sid);
@@ -545,16 +565,16 @@ int peer_connection_loop(PeerConnection* pc) {
 
 #if (CONFIG_DATA_BUFFER_SIZE) > 0
       data = buffer_peak_head(pc->data_rb, &bytes);
-      if (data) {
-        // SpawnWear (Phase 7b): the buffered data path (CONFIG_DATA_BUFFER_SIZE>0) is the LIVE send
-        // path and was hardcoding stream 0, defeating the role-based sid. Send on our DTLS-role
-        // stream (RFC 8832 §6: server=odd, client=even) so SipSorcery/Chrome find the channel.
-        uint16_t dc_sid = peer_connection_default_dc_sid(pc);
+      if (data && bytes >= 2) {
+        // SpawnDev: entries are [u16 sid][payload] (see peer_connection_datachannel_send_sid).
+        uint16_t entry_sid = (uint16_t)(data[0] | (data[1] << 8));
         if (pc->config.datachannel == DATA_CHANNEL_STRING)
-          sctp_outgoing_data(&pc->sctp, (char*)data, bytes, PPID_STRING, dc_sid);
+          sctp_outgoing_data(&pc->sctp, (char*)data + 2, bytes - 2, PPID_STRING, entry_sid);
         else
-          sctp_outgoing_data(&pc->sctp, (char*)data, bytes, PPID_BINARY, dc_sid);
+          sctp_outgoing_data(&pc->sctp, (char*)data + 2, bytes - 2, PPID_BINARY, entry_sid);
         buffer_pop_head(pc->data_rb);
+      } else if (data) {
+        buffer_pop_head(pc->data_rb);  // malformed entry
       }
 #endif
 
