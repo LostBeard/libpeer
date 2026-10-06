@@ -385,6 +385,9 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   free(msg);
   // SpawnDev: remember our own channel's label -> sid too, so peer_connection_lookup_sid finds it.
   sctp_add_stream_mapping(&pc->sctp, label, sid);
+  // SpawnDev: a partial-reliability channel with 0 retransmits (or a timed one) is never retransmitted.
+  int partial = (channel_type & 0x7F) != DATA_CHANNEL_RELIABLE;
+  sctp_set_stream_unreliable(&pc->sctp, sid, partial && (reliability_parameter == 0 || (channel_type & 0x7F) == DATA_CHANNEL_PARTIAL_RELIABLE_TIMED));
   return rtrn;
 }
 
@@ -616,6 +619,8 @@ int peer_connection_loop(PeerConnection* pc) {
         }
       }
 
+      sctp_tick(&pc->sctp);  // SpawnDev: retransmissions + FORWARD-TSN
+
       if (CONFIG_KEEPALIVE_TIMEOUT > 0 && (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {
         LOGI("binding request timeout");
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
@@ -774,4 +779,25 @@ int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
 
   agent->remote_candidates_count++;
   return 0;
+}
+
+// SpawnDev: SCTP send-side counters. 0 retransmits, 1 chunks abandoned, 2 FORWARD-TSN sent, 3 peer supports
+// FORWARD-TSN, 4 reliable chunks sent without a retransmission copy, 5 datagrams dropped by the loss test.
+int peer_connection_get_sctp_stat(PeerConnection* pc, int which) {
+  if (!pc) return -1;
+  switch (which) {
+    case 0: return (int)pc->sctp.stat_retransmits;
+    case 1: return (int)pc->sctp.stat_abandoned;
+    case 2: return (int)pc->sctp.stat_forward_tsn;
+    case 3: return pc->sctp.peer_forward_tsn;
+    case 4: return (int)pc->sctp.stat_unprotected;
+    case 5: return (int)pc->sctp.test_dropped;
+  }
+  return -1;
+}
+
+// SpawnDev: test hook. Drops this share (per mille) of outgoing DATA datagrams before they leave, to prove the
+// retransmission and FORWARD-TSN paths on a real link. 0 = off.
+void peer_connection_set_test_loss(PeerConnection* pc, int permille) {
+  if (pc) pc->sctp.test_drop_permille = permille < 0 ? 0 : (permille > 1000 ? 1000 : (uint32_t)permille);
 }

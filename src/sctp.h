@@ -35,6 +35,7 @@ typedef struct SctpChunkParam {
 typedef enum SctpParamType {
 
   SCTP_PARAM_STATE_COOKIE = 7,
+  SCTP_PARAM_FORWARD_TSN_SUPPORTED = 0xC000,  // RFC 3758
 
 } SctpParamType;
 
@@ -148,6 +149,34 @@ typedef struct {
   uint16_t sid;    // Stream ID
 } SctpStreamEntry;
 
+/* SpawnDev: manual-SCTP send side. Every TSN in flight has an entry, so SACKs can be applied, chunks on reliable
+   streams retransmitted (RFC 4960 6.3) and chunks on no-retransmit streams skipped with FORWARD-TSN (RFC 3758).
+   Without this a single lost datagram was never repaired and left a permanent hole in the receiver's sequence. */
+#define SCTP_TX_WINDOW 512        /* TSNs tracked (about 5 s of 15 fps video) */
+#define SCTP_TX_STORE_SLOTS 24    /* packet copies kept for retransmission (reliable chunks only) */
+#define SCTP_TRACKED_SIDS 32
+#define SCTP_RTO_MIN_MS 400        /* above the peer's delayed-SACK window (up to 200 ms, RFC 4960 6.2) */
+#define SCTP_RTO_MAX_MS 4800
+#define SCTP_MAX_RETRANSMITS 10
+#define SCTP_ABANDON_MS 500       /* no-retransmit chunk still unacked after this: skip it (FORWARD-TSN). Was 200: delayed SACKs made healthy chunks look lost */
+
+typedef enum SctpTxState {
+  SCTP_TX_FREE = 0,
+  SCTP_TX_OUTSTANDING = 1,
+  SCTP_TX_ACKED = 2,
+  SCTP_TX_ABANDONED = 3,
+} SctpTxState;
+
+typedef struct SctpTxEntry {
+  uint32_t tsn;
+  uint32_t sent_ms;
+  uint16_t len;     /* stored packet length */
+  uint8_t state;    /* SctpTxState */
+  uint8_t reliable;
+  uint8_t retries;
+  int8_t slot;      /* index into tx_store, -1 = not stored */
+} SctpTxEntry;
+
 typedef struct Sctp {
   struct socket* sock;
 
@@ -179,6 +208,23 @@ typedef struct Sctp {
   uint32_t rx_frag_ppid;
   int rx_frag_active;
 
+  /* SpawnDev: send side (see SctpTxEntry) */
+  SctpTxEntry* tx;
+  uint8_t* tx_store;
+  uint32_t tx_store_used; /* bit per slot */
+  uint32_t tx_base;       /* oldest TSN not cumulatively acked by the peer */
+  int tx_valid;
+  int peer_forward_tsn;   /* the peer advertised Forward-TSN support */
+  uint8_t sid_unreliable[SCTP_TRACKED_SIDS];
+  uint32_t tx_last_tick_ms;
+  uint32_t tx_last_ftsn_ms;
+  uint32_t stat_retransmits;
+  uint32_t stat_abandoned;
+  uint32_t stat_forward_tsn;
+  uint32_t stat_unprotected;   /* reliable chunks sent while the store was full */
+  uint32_t test_drop_permille; /* test hook: drop this share of outgoing DATA datagrams */
+  uint32_t test_dropped;
+
   uint8_t buf[CONFIG_MTU];
 } Sctp;
 
@@ -191,6 +237,12 @@ int sctp_is_connected(Sctp* sctp);
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len);
 
 int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uint16_t sid);
+
+/* SpawnDev: chunks on this stream are never retransmitted (a partial-reliability channel with 0 retransmits). */
+void sctp_set_stream_unreliable(Sctp* sctp, uint16_t sid, int unreliable);
+
+/* SpawnDev: retransmission / FORWARD-TSN timer; call from the connection loop. */
+void sctp_tick(Sctp* sctp);
 
 void sctp_onmessage(Sctp* sctp, void (*onmessage)(char* msg, size_t len, void* userdata, uint16_t sid));
 
