@@ -167,6 +167,18 @@ typedef struct Sctp {
   void (*onclose)(void* userdata);
 
   void* userdata;
+
+  /* SpawnDev: manual-SCTP receive state (cumulative TSN + 64-TSN gap window, one reassembly). */
+  int rx_tsn_valid;
+  uint32_t rx_cum_tsn;
+  uint64_t rx_gap_bits; /* bit i set = TSN rx_cum_tsn + 2 + i received out of order */
+  uint8_t* rx_frag;
+  size_t rx_frag_len;
+  uint32_t rx_frag_next_tsn;
+  uint16_t rx_frag_sid;
+  uint32_t rx_frag_ppid;
+  int rx_frag_active;
+
   uint8_t buf[CONFIG_MTU];
 } Sctp;
 

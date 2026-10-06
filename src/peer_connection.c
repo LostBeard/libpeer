@@ -347,6 +347,8 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   char* msg = calloc(1, msg_size);
 
   msg[0] = DATA_CHANNEL_OPEN;
+  // SpawnDev: the channel type was never written, so every channel opened as reliable + ordered (RFC 8832).
+  msg[1] = (char)channel_type;
   memcpy(msg + 2, &priority_big_endian, sizeof(uint16_t));
   memcpy(msg + 4, &reliability_big_endian, sizeof(uint32_t));
   memcpy(msg + 8, &label_length, sizeof(uint16_t));
@@ -356,6 +358,8 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
 
   rtrn = sctp_outgoing_data(&pc->sctp, msg, msg_size, PPID_CONTROL, sid);
   free(msg);
+  // SpawnDev: remember our own channel's label -> sid too, so peer_connection_lookup_sid finds it.
+  sctp_add_stream_mapping(&pc->sctp, label, sid);
   return rtrn;
 }
 

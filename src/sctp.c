@@ -216,6 +216,152 @@ void sctp_handle_sctp_packet(Sctp* sctp, char* buf, size_t len) {
     sctp_parse_data_channel_open(sctp, sid, buf + 28, len - 28);
 }
 
+#if !CONFIG_USE_USRSCTP
+#define SCTP_RX_MAX_MESSAGE (64 * 1024)
+
+static void sctp_rx_deliver(Sctp* sctp, uint32_t ppid, uint16_t sid, uint8_t* data, size_t len,
+                            uint16_t* dcep_ack_sid, int* dcep_ack_pending) {
+  if (ppid == DATA_CHANNEL_PPID_CONTROL) {
+    if (len >= 12 && data[0] == DATA_CHANNEL_OPEN) {
+      uint16_t label_length = ntohs(*(uint16_t*)(data + 8));
+      if (12 + (size_t)label_length <= len) {
+        char label[32];
+        size_t n = label_length < sizeof(label) - 1 ? label_length : sizeof(label) - 1;
+        memcpy(label, data + 12, n);
+        label[n] = 0;
+        sctp_add_stream_mapping(sctp, label, sid);
+      }
+      *dcep_ack_sid = sid;
+      *dcep_ack_pending = 1;
+    }
+    return;
+  }
+  if (ppid == DATA_CHANNEL_PPID_DOMSTRING || ppid == DATA_CHANNEL_PPID_BINARY ||
+      ppid == DATA_CHANNEL_PPID_DOMSTRING_PARTIAL || ppid == DATA_CHANNEL_PPID_BINARY_PARTIAL) {
+    if (sctp->onmessage)
+      sctp->onmessage((char*)data, len, sctp->userdata, sid);
+  }
+  // empty-message PPIDs carry nothing to deliver
+}
+
+// Records a TSN. Returns 1 if new, 0 if a duplicate (already received: ack it, never deliver twice).
+static int sctp_rx_track_tsn(Sctp* sctp, uint32_t tsn) {
+  if (!sctp->rx_tsn_valid) {
+    sctp->rx_cum_tsn = tsn - 1;
+    sctp->rx_gap_bits = 0;
+    sctp->rx_tsn_valid = 1;
+  }
+  int32_t ahead = (int32_t)(tsn - sctp->rx_cum_tsn);
+  if (ahead <= 0)
+    return 0;
+  if (ahead == 1) {
+    sctp->rx_cum_tsn = tsn;
+    while (sctp->rx_gap_bits & 1) {  // close any gap this TSN filled
+      sctp->rx_gap_bits >>= 1;
+      sctp->rx_cum_tsn++;
+    }
+    sctp->rx_gap_bits >>= 1;
+    return 1;
+  }
+  int bit = ahead - 2;
+  if (bit >= 64)
+    return 1;  // beyond the gap window: deliver; the SACK makes the peer resend the gap later
+  if (sctp->rx_gap_bits & ((uint64_t)1 << bit))
+    return 0;
+  sctp->rx_gap_bits |= ((uint64_t)1 << bit);
+  return 1;
+}
+
+static void sctp_rx_data_chunk(Sctp* sctp, SctpDataChunk* chunk, uint16_t* dcep_ack_sid, int* dcep_ack_pending) {
+  size_t chunk_len = ntohs(chunk->length);
+  if (chunk_len < sizeof(SctpDataChunk))
+    return;
+  size_t data_len = chunk_len - sizeof(SctpDataChunk);
+  uint32_t tsn = ntohl(chunk->tsn);
+  uint16_t sid = ntohs(chunk->sid);
+  uint32_t ppid = ntohl(chunk->ppid);
+  int begin = (chunk->iube & 0x02) != 0;
+  int end = (chunk->iube & 0x01) != 0;
+
+  if (!sctp_rx_track_tsn(sctp, tsn))
+    return;
+
+  if (begin && end) {
+    sctp_rx_deliver(sctp, ppid, sid, chunk->data, data_len, dcep_ack_sid, dcep_ack_pending);
+    return;
+  }
+
+  // Fragmented message: reassembled when fragments arrive in TSN order (the normal case). A fragment out of
+  // order drops the partial message (control messages are small, so reliable channels rarely fragment).
+  if (begin) {
+    if (!sctp->rx_frag) {
+      sctp->rx_frag = (uint8_t*)malloc(SCTP_RX_MAX_MESSAGE);
+      if (!sctp->rx_frag)
+        return;
+    }
+    sctp->rx_frag_len = 0;
+    sctp->rx_frag_sid = sid;
+    sctp->rx_frag_ppid = ppid;
+    sctp->rx_frag_active = 1;
+  } else if (!sctp->rx_frag_active || tsn != sctp->rx_frag_next_tsn || sid != sctp->rx_frag_sid) {
+    sctp->rx_frag_active = 0;
+    return;
+  }
+  if (sctp->rx_frag_len + data_len > SCTP_RX_MAX_MESSAGE) {
+    LOGE("sctp: message larger than %d bytes dropped", SCTP_RX_MAX_MESSAGE);
+    sctp->rx_frag_active = 0;
+    return;
+  }
+  memcpy(sctp->rx_frag + sctp->rx_frag_len, chunk->data, data_len);
+  sctp->rx_frag_len += data_len;
+  sctp->rx_frag_next_tsn = tsn + 1;
+  if (end) {
+    sctp->rx_frag_active = 0;
+    sctp_rx_deliver(sctp, sctp->rx_frag_ppid, sctp->rx_frag_sid, sctp->rx_frag, sctp->rx_frag_len,
+                    dcep_ack_sid, dcep_ack_pending);
+  }
+}
+
+static void sctp_send_sack(Sctp* sctp) {
+  SctpPacket* out_packet = (SctpPacket*)sctp->buf;
+  SctpSackChunk* sack = (SctpSackChunk*)out_packet->chunks;
+  memset(sctp->buf, 0, sizeof(SctpHeader) + sizeof(SctpSackChunk) + 16 * 4);
+
+  // Gap ack blocks: runs of set bits, offsets relative to the cumulative TSN (bit i = offset i + 2).
+  uint16_t* blocks = (uint16_t*)sack->blocks;
+  int nblocks = 0;
+  uint64_t bits = sctp->rx_gap_bits;
+  for (int i = 0; i < 64 && nblocks < 16;) {
+    if (!(bits & ((uint64_t)1 << i))) {
+      i++;
+      continue;
+    }
+    int start = i;
+    while (i < 64 && (bits & ((uint64_t)1 << i)))
+      i++;
+    blocks[nblocks * 2] = htons((uint16_t)(start + 2));
+    blocks[nblocks * 2 + 1] = htons((uint16_t)(i - 1 + 2));
+    nblocks++;
+  }
+
+  sack->common.type = SCTP_SACK;
+  sack->common.flags = 0x00;
+  sack->common.length = htons(16 + nblocks * 4);
+  sack->cumulative_tsn_ack = htonl(sctp->rx_cum_tsn);
+  sack->a_rwnd = htonl(SCTP_RX_MAX_MESSAGE);  // every message goes straight to the app
+  sack->number_of_gap_ack_blocks = htons(nblocks);
+  sack->number_of_dup_tsns = 0;
+
+  size_t length = sizeof(SctpHeader) + 16 + nblocks * 4;
+  out_packet->header.source_port = htons(sctp->local_port);
+  out_packet->header.destination_port = htons(sctp->remote_port);
+  out_packet->header.verification_tag = sctp->verification_tag;
+  out_packet->header.checksum = 0x00;
+  out_packet->header.checksum = sctp_get_checksum(sctp, sctp->buf, length);
+  dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
+}
+#endif
+
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
   if (!sctp)
     return;
@@ -246,49 +392,27 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
     return;
   }
 
+  int need_sack = 0;
+  int dcep_ack_pending = 0;
+  uint16_t dcep_ack_sid = 0;
+
   // prepare outgoing packet
   memset(sctp->buf, 0, sizeof(sctp->buf));
-  while ((4 * (pos + 3) / 4) < len) {
+  while (pos + sizeof(SctpChunkCommon) <= len) {
     chunk_common = (SctpChunkCommon*)(buf + pos);
+    size_t chunk_len = ntohs(chunk_common->length);
+    if (chunk_len < sizeof(SctpChunkCommon) || pos + chunk_len > len)
+      break;  // malformed: stop rather than loop forever or read past the packet
 
     switch (chunk_common->type) {
       case SCTP_DATA: {
-        SctpDataChunk* data_chunk = (SctpDataChunk*)(buf + pos);
-        SctpSackChunk* sack_chunk = (SctpSackChunk*)out_packet->chunks;
-
-        sack_chunk->common.type = SCTP_SACK;
-        sack_chunk->common.flags = 0x00;
-        sack_chunk->common.length = htons(16);
-        sack_chunk->cumulative_tsn_ack = data_chunk->tsn;
-        sack_chunk->a_rwnd = htonl(0x02);
-        length = ntohs(sack_chunk->common.length) + sizeof(SctpHeader);
-
-        LOGD("SCTP_DATA. ppid = %ld, data = %.2x", ntohl(data_chunk->ppid), data_chunk->data[0]);
-        if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_CONTROL && data_chunk->data[0] == DATA_CHANNEL_OPEN) {
-          data_chunk = (SctpDataChunk*)sack_chunk->blocks;
-          data_chunk->type = SCTP_DATA;
-          data_chunk->iube = 0x03;
-          data_chunk->tsn = htonl(sctp->tsn++);
-          data_chunk->sid = htons(0);
-          data_chunk->sqn = htons(0);
-          data_chunk->ppid = htonl(DATA_CHANNEL_PPID_CONTROL);
-          data_chunk->length = htons(1 + sizeof(SctpDataChunk));
-          data_chunk->data[0] = DATA_CHANNEL_ACK;
-          length += ntohs(data_chunk->length);
-        } else if (ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING ||
-                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY ||
-                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_DOMSTRING_PARTIAL ||
-                   ntohl(data_chunk->ppid) == DATA_CHANNEL_PPID_BINARY_PARTIAL) {
-          // SpawnWear (Phase 7c): the manual SCTP path only delivered DOMSTRING to onmessage, so
-          // every BINARY data-channel message (the WebRtcChallenge nonces/responses, and all app
-          // data) was silently dropped on RECEIVE - the watch had only ever SENT before. Deliver
-          // BINARY (+ the partial variants) too. usrsctp's sctp_handle_incoming_data already does.
-          if (sctp->onmessage) {
-            sctp->onmessage((char*)data_chunk->data, ntohs(data_chunk->length) - sizeof(SctpDataChunk),
-                            sctp->userdata, ntohs(data_chunk->sid));
-          }
-        }
-        pos = len;  // Do not handle other msg
+        // SpawnDev: every DATA chunk in the packet is processed (Chrome bundles small messages), fragments are
+        // reassembled, and ONE SACK with the true cumulative TSN + gap blocks is sent after the loop. The old code
+        // handled only the first chunk, delivered fragments as separate messages, acked any TSN as cumulative and
+        // advertised a 2-byte window.
+        sctp_rx_data_chunk(sctp, (SctpDataChunk*)(buf + pos), &dcep_ack_sid, &dcep_ack_pending);
+        need_sack = 1;
+        length = 0;
       } break;
       case SCTP_INIT: {
         LOGD("SCTP_INIT");
@@ -296,6 +420,9 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         SctpInitChunk* init_chunk;
         init_chunk = (SctpInitChunk*)in_packet->chunks;
         sctp->verification_tag = init_chunk->initiate_tag;
+        sctp->rx_cum_tsn = ntohl(init_chunk->initial_tsn) - 1;
+        sctp->rx_gap_bits = 0;
+        sctp->rx_tsn_valid = 1;
 
         SctpInitChunk* init_ack = (SctpInitChunk*)out_packet->chunks;
         init_ack->common.type = SCTP_INIT_ACK;
@@ -324,6 +451,9 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       case SCTP_INIT_ACK: {
         SctpInitChunk* init_ack = (SctpInitChunk*)in_packet->chunks;
         SctpCookieEchoChunk* cookie_echo = (SctpCookieEchoChunk*)out_packet->chunks;
+        sctp->rx_cum_tsn = ntohl(init_ack->initial_tsn) - 1;
+        sctp->rx_gap_bits = 0;
+        sctp->rx_tsn_valid = 1;
         SctpChunkParam* param = NULL;
         sctp->verification_tag = init_ack->initiate_tag;
         int type;
@@ -421,7 +551,16 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
       // sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0);
     }
-    pos += ntohs(chunk_common->length);
+    if (pos >= len)
+      break;  // a handler consumed the rest of the packet
+    pos += (chunk_len + 3) & ~(size_t)3;  // chunks are padded to 4 bytes
+  }
+
+  if (need_sack)
+    sctp_send_sack(sctp);
+  if (dcep_ack_pending) {
+    char ack = DATA_CHANNEL_ACK;
+    sctp_outgoing_data(sctp, &ack, 1, PPID_CONTROL, dcep_ack_sid);
   }
 #endif
 }
@@ -606,6 +745,12 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 
   sctp->sock = sock;
 #else
+  // SpawnDev: fresh receive state per association (a reconnect must not inherit the last session's TSNs).
+  sctp->rx_tsn_valid = 0;
+  sctp->rx_gap_bits = 0;
+  sctp->rx_frag_active = 0;
+  sctp->rx_frag_len = 0;
+
   // send SCTP_INIT
   int length = 0;
   SctpInitChunk* init_chunk;
@@ -641,6 +786,12 @@ void sctp_destroy_association(Sctp* sctp) {
     usrsctp_close(sctp->sock);
     usrsctp_finish();
     sctp->sock = NULL;
+  }
+#else
+  if (sctp && sctp->rx_frag) {
+    free(sctp->rx_frag);  // SpawnDev: reassembly buffer
+    sctp->rx_frag = NULL;
+    sctp->rx_frag_active = 0;
   }
 #endif
 }
