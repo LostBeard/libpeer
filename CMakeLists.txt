@@ -1,10 +1,17 @@
 cmake_minimum_required(VERSION 3.1)
 
-include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreHTTP/httpFilePaths.cmake)
-include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreMQTT/mqttFilePaths.cmake)
-
 if (DEFINED ENV{IDF_PATH})
   file(GLOB ESP32_CODES "./src/*.c")
+  # SpawnDev: libpeer's own signaling (peer_signaling.c: WHIP over coreHTTP, MQTT over coreMQTT) is opt-in on ESP-IDF.
+  # Apps that signal themselves (e.g. a WebTorrent tracker client in C#) do not need it, and leaving it out removes
+  # the coreHTTP/coreMQTT/llhttp submodules - whose nesting pushed git paths past Windows' 260-char limit - and their
+  # flash. Set LIBPEER_SIGNALING=ON (CMake cache) to build it.
+  if (LIBPEER_SIGNALING)
+    include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreHTTP/httpFilePaths.cmake)
+    include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreMQTT/mqttFilePaths.cmake)
+  else()
+    list(FILTER ESP32_CODES EXCLUDE REGEX "(peer_signaling|ssl_transport)\\.c$")
+  endif()
   idf_component_register(
    SRCS ${ESP32_CODES} ${HTTP_SOURCES} ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES}
    INCLUDE_DIRS "./include" ${HTTP_INCLUDE_PUBLIC_DIRS} ${MQTT_INCLUDE_PUBLIC_DIRS}
@@ -14,6 +21,9 @@ if (DEFINED ENV{IDF_PATH})
   add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN" "-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" "-DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
   return()
 endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreHTTP/httpFilePaths.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreMQTT/mqttFilePaths.cmake)
 
 project(peer)
 

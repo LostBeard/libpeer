@@ -1,18 +1,28 @@
+# SpawnDev (branch spawndev-nf): the ESP-IDF build uses IDF mbedtls/json and the srtp component and leaves out
+# libpeer signaling, so none of these are needed there. update = none keeps "git clone --recursive" from
+# fetching them (coreHTTP nests llhttp deep enough to exceed the Windows 260-char path limit). For a desktop
+# build: git submodule update --init --checkout third_party/<name>
 [submodule "third_party/libsrtp"]
 	path = third_party/libsrtp
 	url = https://github.com/cisco/libsrtp.git
+	update = none
 [submodule "third_party/cJSON"]
 	path = third_party/cJSON
 	url = https://github.com/DaveGamble/cJSON.git
+	update = none
 [submodule "third_party/usrsctp"]
 	path = third_party/usrsctp
 	url = https://github.com/sctplab/usrsctp.git
+	update = none
 [submodule "third_party/mbedtls"]
 	path = third_party/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
+	update = none
 [submodule "third_party/coreHTTP"]
 	path = third_party/coreHTTP
 	url = https://github.com/FreeRTOS/coreHTTP
+	update = none
 [submodule "third_party/coreMQTT"]
 	path = third_party/coreMQTT
 	url = https://github.com/FreeRTOS/coreMQTT
+	update = none
