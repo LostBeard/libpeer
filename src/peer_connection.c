@@ -288,6 +288,11 @@ static inline uint16_t peer_connection_default_dc_sid(PeerConnection* pc) {
   return pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER ? 1 : 0;
 }
 
+int peer_connection_is_dtls_server(PeerConnection* pc) {
+  // SpawnDev: lets callers pick RFC 8832 stream ids (DTLS server = odd, client = even) for extra channels.
+  return pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER ? 1 : 0;
+}
+
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
   return peer_connection_datachannel_send_sid(pc, message, len, peer_connection_default_dc_sid(pc));
 }

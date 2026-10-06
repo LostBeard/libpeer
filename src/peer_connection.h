@@ -115,6 +115,11 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
  */
 int peer_connection_datachannel_send_sid_direct(PeerConnection* pc, char* message, size_t len, uint16_t sid);
 
+/**
+ * @brief 1 if this side is the DTLS server (its data channels use odd stream ids), 0 if the client (even ids).
+ */
+int peer_connection_is_dtls_server(PeerConnection* pc);
+
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);
