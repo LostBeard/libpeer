@@ -35,4 +35,8 @@ int tcp_socket_send(TcpSocket* tcp_socket, const uint8_t* buf, int len);
 
 int tcp_socket_recv(TcpSocket* tcp_socket, uint8_t* buf, int len);
 
+// SpawnDev: send-path counters (see udp_socket_sendto).
+extern volatile uint32_t g_udp_send_errors;
+extern volatile uint32_t g_udp_send_retries;
+
 #endif  // SOCKET_H_
