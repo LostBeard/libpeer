@@ -586,36 +586,45 @@ int peer_connection_loop(PeerConnection* pc) {
       }
 #endif
 
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
-        LOGD("agent_recv %d", pc->agent_ret);
+      // SpawnDev: read every waiting datagram (bounded), not one per pass. The pump sleeps a FreeRTOS tick (10 ms)
+      // between passes, so one read per pass capped intake near 100 packets/s; a peer that SACKs every packet
+      // (SipSorcery) during video filled that, its ICE consent checks waited behind the SACKs, and after 8 s
+      // unanswered it declared the connection dead.
+      for (int rx_burst = 0; rx_burst < 16; rx_burst++) {
+        if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+          LOGD("agent_recv %d", pc->agent_ret);
 
-        if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
-          LOGD("Got RTCP packet");
-          dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-          peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
+          if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
+            LOGD("Got RTCP packet");
+            dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+            peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
 
-        } else if (dtls_srtp_probe(pc->agent_buf)) {
-          int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
-          LOGD("Got DTLS data %d", ret);
+          } else if (dtls_srtp_probe(pc->agent_buf)) {
+            int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
+            LOGD("Got DTLS data %d", ret);
 
-          if (ret > 0) {
-            sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
+            if (ret > 0) {
+              sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
+            }
+
+          } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
+            LOGD("Got RTP packet");
+
+            dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+
+            ssrc = rtp_get_ssrc(pc->agent_buf);
+            if (ssrc == pc->remote_assrc) {
+              rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
+            } else if (ssrc == pc->remote_vssrc) {
+              rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+            }
+
+          } else {
+            LOGW("Unknown data");
           }
-
-        } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
-          LOGD("Got RTP packet");
-
-          dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-
-          ssrc = rtp_get_ssrc(pc->agent_buf);
-          if (ssrc == pc->remote_assrc) {
-            rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
-          } else if (ssrc == pc->remote_vssrc) {
-            rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
-          }
-
-        } else {
-          LOGW("Unknown data");
+        }
+        if (pc->agent.last_rx_bytes <= 0) {
+          break;  // nothing more waiting
         }
       }
 

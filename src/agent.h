@@ -59,6 +59,7 @@ struct Agent {
   Address host_addr;
   int b_host_addr;
   uint64_t binding_request_time;
+  int last_rx_bytes;  /* SpawnDev: bytes the last agent_recv read from the socket (0 = nothing was waiting) */
   AgentState state;
 
   AgentMode mode;
