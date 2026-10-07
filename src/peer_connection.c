@@ -557,6 +557,7 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
     }
     case PEER_CONNECTION_COMPLETED:
+      pc->agent.nonblocking = 1;
 
 #if (CONFIG_VIDEO_BUFFER_SIZE) > 0
       data = buffer_peak_head(pc->video_rb, &bytes);
@@ -823,6 +824,7 @@ int peer_connection_get_ice_stat(PeerConnection* pc, int which) {
     case 6: return (int)pc->hs_rx;
     case 7: return (int)pc->dtls_srtp.ssl.MBEDTLS_PRIVATE(state);
     case 8: return (int)pc->sctp.stat_hs_retransmits;
+    case 9: return mbedtls_ssl_get_ciphersuite_id_from_ssl(&pc->dtls_srtp.ssl);
   }
   return -1;
 }

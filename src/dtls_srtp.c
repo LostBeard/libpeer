@@ -16,6 +16,17 @@
 #include "socket.h"
 #include "utils.h"
 
+// SpawnDev: time spent in application-data writes (encrypt + UDP send), to find where video send time goes.
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define SD_NOW_US() esp_timer_get_time()
+#else
+#define SD_NOW_US() 0
+#endif
+volatile uint32_t g_dtls_write_us = 0;
+volatile uint32_t g_dtls_writes = 0;
+
+
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -242,6 +253,28 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
 
   mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+
+#if defined(MBEDTLS_CHACHAPOLY_C)
+  // SpawnDev: ChaCha20-Poly1305 first, then mbedTLS's own order. On chips without GCM hardware (ESP32 classic) GCM's
+  // GHASH runs from lookup tables, and with the cache shared and mbedTLS state in PSRAM a 1200-byte record took ~3 ms
+  // to encrypt while video streamed (measured); ChaCha20-Poly1305 is plain register arithmetic. mbedTLS servers use
+  // their own preference order, so this decides when we are the DTLS server; as a client it is our offer order.
+  {
+    static int suites[64];
+    static int built = 0;
+    if (!built) {
+      int n = 0;
+      suites[n++] = MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256;
+      suites[n++] = MBEDTLS_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256;
+      for (const int* d = mbedtls_ssl_list_ciphersuites(); *d != 0 && n < 63; d++) {
+        if (*d != suites[0] && *d != suites[1]) suites[n++] = *d;
+      }
+      suites[n] = 0;
+      built = 1;
+    }
+    mbedtls_ssl_conf_ciphersuites(&dtls_srtp->conf, suites);
+  }
+#endif
 
   mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
 
@@ -561,11 +594,14 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
 
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
   int ret;
+  int64_t t0 = SD_NOW_US();
 
   do {
     ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
 
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  g_dtls_write_us += (uint32_t)(SD_NOW_US() - t0);
+  g_dtls_writes++;
   return ret;
 }
 

@@ -68,7 +68,9 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
   };
 
   tv.tv_sec = 0;
-  tv.tv_usec = AGENT_POLL_TIMEOUT * 1000;
+  // SpawnDev: once connected the caller loops on its own schedule, so only poll. A 1 ms timeout is a whole FreeRTOS
+  // tick (10 ms at 100 Hz) on ESP32, and the last, empty read of every pass waited it out: ~10 ms per video frame.
+  tv.tv_usec = agent->nonblocking ? 0 : AGENT_POLL_TIMEOUT * 1000;
   FD_ZERO(&rfds);
 
   for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
@@ -523,6 +525,7 @@ void agent_set_remote_description(Agent* agent, char* description) {
 
   LOGD("remote ufrag: %s", agent->remote_ufrag);
   agent->wait_checks = 0;
+  agent->nonblocking = 0;  // a new negotiation runs ICE again: wait-paced reads until connected
   agent->selected_pair = NULL;
   agent->nominated_pair = NULL;
   LOGD("remote upwd: %s", agent->remote_upwd);

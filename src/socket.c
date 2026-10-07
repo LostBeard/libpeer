@@ -8,6 +8,7 @@
 #ifdef ESP_PLATFORM
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #define UDP_SEND_BACKOFF() vTaskDelay(1)
 #else
 #define UDP_SEND_BACKOFF() usleep(1000)
@@ -16,6 +17,8 @@
 
 volatile uint32_t g_udp_send_errors = 0;   // datagrams dropped after the retries
 volatile uint32_t g_udp_send_retries = 0;  // transient buffer-full retries
+volatile uint32_t g_udp_send_us = 0;       // time in sendto, retries included
+volatile uint32_t g_udp_sends = 0;
 
 int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   int ret = 0;
@@ -139,8 +142,15 @@ int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, 
   // SpawnDev: a burst (a video frame is several datagrams back to back) can find lwIP / the WiFi driver out of buffers
   // for a moment; sendto then fails with ENOMEM/ENOBUFS/EAGAIN and the datagram was silently lost. SCTP here never
   // retransmits, so retry briefly instead, and count both outcomes so the loss is measurable.
+#ifdef ESP_PLATFORM
+  int64_t t0 = esp_timer_get_time();
+#endif
   for (int attempt = 0;; attempt++) {
     if ((ret = sendto(udp_socket->fd, buf, len, 0, sa, sock_len)) >= 0) {
+#ifdef ESP_PLATFORM
+      g_udp_send_us += (uint32_t)(esp_timer_get_time() - t0);
+#endif
+      g_udp_sends++;
       break;
     }
     int err = errno;
