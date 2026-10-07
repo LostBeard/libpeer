@@ -10,6 +10,11 @@ int ports_resolve_mdns_host(const char* host, Address* addr);
 
 int ports_get_host_addr(Address* addr, const char* iface_prefix);
 
+#if CONFIG_USE_LWIP
+int ports_get_host_addrs_ipv4(Address* addrs, int max);
+int ports_is_on_link_ipv4(const Address* addr);
+#endif
+
 uint32_t ports_get_epoch_time();
 
 void ports_sleep_ms(int ms);

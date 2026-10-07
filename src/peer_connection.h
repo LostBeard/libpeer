@@ -100,6 +100,7 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
 
 /* SpawnDev: SCTP send-side counters (see peer_connection.c) and a loss-test hook. */
 int peer_connection_get_sctp_stat(PeerConnection* pc, int which);
+int peer_connection_get_ice_stat(PeerConnection* pc, int which);
 void peer_connection_set_test_loss(PeerConnection* pc, int permille);
 
 /**

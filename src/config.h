@@ -75,6 +75,12 @@
 #endif
 
 #define CONFIG_IPV6 0
+
+// SpawnDev: resolve mDNS (.local) remote candidates by blocking multicast queries; off = learn the peer's address
+// from its connectivity checks (peer-reflexive), see ice.c
+#ifndef CONFIG_MDNS_RESOLVE
+#define CONFIG_MDNS_RESOLVE 0
+#endif
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
 

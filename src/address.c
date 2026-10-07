@@ -53,7 +53,17 @@ int addr_to_string(const Address* addr, char* buf, size_t len) {
   return 0;
 }
 
+// SpawnDev: was a TODO stub returning 1 (every address "equal"); peer-reflexive learning (agent.c) needs the real
+// comparison: family, port and IP address.
 int addr_equal(const Address* a, const Address* b) {
-  // TODO
-  return 1;
+  if (a->family != b->family || a->port != b->port) {
+    return 0;
+  }
+  switch (a->family) {
+    case AF_INET6:
+      return memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(a->sin6.sin6_addr)) == 0;
+    case AF_INET:
+    default:
+      return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
+  }
 }

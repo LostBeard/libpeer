@@ -70,6 +70,8 @@ struct Agent {
 
   int candidate_pairs_num;
   int use_candidate;
+  int prflx_learned; /* SpawnDev: peer-reflexive candidates learned this session */
+  int wait_checks; /* SpawnDev: passes spent waiting for the peer's checks while there is no pair to check */
   uint32_t transaction_id[3];
 };
 

@@ -805,6 +805,21 @@ int peer_connection_get_sctp_stat(PeerConnection* pc, int which) {
   return -1;
 }
 
+// SpawnDev: ICE diagnostics. 0 peer-reflexive candidates learned, 1 type of the selected pair's remote candidate
+// (IceCandidateType, -1 before one is selected), 2 its IPv4 address (network order), 3 candidate pairs, 4 local
+// candidates.
+int peer_connection_get_ice_stat(PeerConnection* pc, int which) {
+  if (!pc) return -1;
+  switch (which) {
+    case 0: return pc->agent.prflx_learned;
+    case 1: return pc->agent.selected_pair ? (int)pc->agent.selected_pair->remote->type : -1;
+    case 2: return pc->agent.selected_pair ? (int)pc->agent.selected_pair->remote->addr.sin.sin_addr.s_addr : 0;
+    case 3: return pc->agent.candidate_pairs_num;
+    case 4: return pc->agent.local_candidates_count;
+  }
+  return -1;
+}
+
 // SpawnDev: test hook. Drops this share (per mille) of outgoing DATA datagrams before they leave, to prove the
 // retransmission and FORWARD-TSN paths on a real link. 0 = off.
 void peer_connection_set_test_loss(PeerConnection* pc, int permille) {

@@ -130,7 +130,24 @@ static int agent_create_host_addr(Agent* agent) {
 #endif
   };
 
+#if CONFIG_USE_LWIP
+  {
+    // SpawnDev: one IPv4 host candidate per interface (station and access point), not only the first interface.
+    Address addrs[AGENT_MAX_CANDIDATES];
+    int n = ports_get_host_addrs_ipv4(addrs, AGENT_MAX_CANDIDATES);
+    for (j = 0; j < n && agent->local_candidates_count < AGENT_MAX_CANDIDATES; j++) {
+      ice_candidate = agent->local_candidates + agent->local_candidates_count;
+      ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_HOST,
+                           &agent->udp_sockets[0].bind_addr);
+      memcpy(&ice_candidate->addr.sin.sin_addr, &addrs[j].sin.sin_addr, sizeof(addrs[j].sin.sin_addr));
+      agent->local_candidates_count++;
+    }
+  }
+  (void)iface_prefx;
+  for (i = 1; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {  // IPv6 (if enabled): unchanged, first address
+#else
   for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
+#endif
     for (j = 0; j < sizeof(iface_prefx) / sizeof(iface_prefx[0]); j++) {
       ice_candidate = agent->local_candidates + agent->local_candidates_count;
       // only copy port and family to addr of ice candidate
@@ -338,6 +355,78 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
 }
 
+// SpawnDev: peer-reflexive candidates (RFC 8445 7.3.1.3). A valid check from an address that is not one of the
+// peer's signaled candidates is the peer's real address: add it as a remote candidate, pair it with every local
+// candidate, and check it next (a triggered check). Browsers hide their LAN address behind an mDNS name
+// (xxxx.local) that is not resolved here (resolving blocked the caller for up to 15 s), so on a LAN with no STUN,
+// such as a device's own access point, this is how the two sides find each other.
+static void agent_learn_peer_reflexive(Agent* agent, Address* addr) {
+  int i;
+  IceCandidate* candidate;
+  IceCandidatePair* first_new = NULL;
+  char addr_string[ADDRSTRLEN];
+
+  if (agent->selected_pair != NULL) {
+    return;  // connected: never change the path under a running session
+  }
+  for (i = 0; i < agent->remote_candidates_count; i++) {
+    if (addr_equal(&agent->remote_candidates[i].addr, addr)) {
+      return;
+    }
+  }
+  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
+    return;
+  }
+
+  agent->prflx_learned++;
+  candidate = &agent->remote_candidates[agent->remote_candidates_count];
+  memset(candidate, 0, sizeof(IceCandidate));
+  ice_candidate_create(candidate, 0, ICE_CANDIDATE_TYPE_PRFLX, addr);
+  snprintf(candidate->foundation, sizeof(candidate->foundation), "prflx%d", agent->remote_candidates_count);
+  agent->remote_candidates_count++;
+
+  for (i = 0; i < agent->local_candidates_count && agent->candidate_pairs_num < AGENT_MAX_CANDIDATE_PAIRS; i++) {
+    IceCandidatePair* pair;
+    if (agent->local_candidates[i].addr.family != candidate->addr.family) {
+      continue;
+    }
+    pair = &agent->candidate_pairs[agent->candidate_pairs_num++];
+    pair->local = &agent->local_candidates[i];
+    pair->remote = candidate;
+    pair->priority = agent->local_candidates[i].priority + candidate->priority;
+    pair->state = ICE_CANDIDATE_STATE_FROZEN;
+    pair->conncheck = 0;
+    if (first_new == NULL) {
+      first_new = pair;
+    }
+  }
+  if (first_new == NULL) {
+    return;
+  }
+
+  // Triggered check, unless the pair being checked goes to a peer host address on one of this device's own subnets:
+  // that is the direct LAN path, and a peer on the same LAN can also reach this device through the router (NAT
+  // hairpin on its server-reflexive address) from an address it never signaled. A host address elsewhere is no such
+  // path: a desktop peer on two networks signaled only its Ethernet address while this device was its own access
+  // point; waiting for that pair to fail delayed the connection 21 s (measured, MiniRover play mode). Over a
+  // srflx/relay pair, or with no pair at all (the peer sent only an mDNS name), the learned address is checked now.
+  if (agent->nominated_pair != NULL && agent->nominated_pair->state == ICE_CANDIDATE_STATE_INPROGRESS) {
+    if (agent->nominated_pair->remote->type == ICE_CANDIDATE_TYPE_HOST
+#if CONFIG_USE_LWIP
+        && ports_is_on_link_ipv4(&agent->nominated_pair->remote->addr)
+#endif
+    ) {
+      return;
+    }
+    agent->nominated_pair->state = ICE_CANDIDATE_STATE_FROZEN;
+  }
+  first_new->state = ICE_CANDIDATE_STATE_INPROGRESS;
+  agent->nominated_pair = first_new;
+
+  addr_to_string(addr, addr_string, sizeof(addr_string));
+  LOGI("peer-reflexive candidate %s:%d learned from the peer's check", addr_string, addr->port);
+}
+
 void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
   StunMessage msg;
   StunHeader* header;
@@ -349,6 +438,7 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
         agent->binding_request_time = ports_get_epoch_time();
+        agent_learn_peer_reflexive(agent, addr);
       }
       break;
     default:
@@ -432,6 +522,9 @@ void agent_set_remote_description(Agent* agent, char* description) {
   }
 
   LOGD("remote ufrag: %s", agent->remote_ufrag);
+  agent->wait_checks = 0;
+  agent->selected_pair = NULL;
+  agent->nominated_pair = NULL;
   LOGD("remote upwd: %s", agent->remote_upwd);
 
   // Please set gather candidates before set remote description
@@ -453,6 +546,17 @@ int agent_connectivity_check(Agent* agent) {
   char addr_string[ADDRSTRLEN];
   uint8_t buf[1400];
   StunMessage msg;
+
+  if (agent->nominated_pair == NULL) {
+    // SpawnDev: nothing to check yet; keep answering (and learning from) the peer's checks.
+    agent_recv(agent, buf, sizeof(buf));
+    return -1;
+  }
+
+  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent->selected_pair = agent->nominated_pair;
+    return 0;
+  }
 
   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
     LOGI("nominated pair is not in progress");
@@ -478,8 +582,21 @@ int agent_connectivity_check(Agent* agent) {
   return -1;
 }
 
+// SpawnDev: keep checking the pair in progress, else start the next frozen one, else use one that succeeded.
+// Upstream walked the list in order and nominated the first FROZEN pair even while a later pair was in progress;
+// with peer-reflexive pairs added during checking (agent_learn_peer_reflexive) that ran two checks at once.
 int agent_select_candidate_pair(Agent* agent) {
   int i;
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
+      agent->candidate_pairs[i].conncheck++;
+      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
+        agent->nominated_pair = &agent->candidate_pairs[i];
+        return 0;
+      }
+      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
+    }
+  }
   for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
       // nominate this pair
@@ -487,17 +604,19 @@ int agent_select_candidate_pair(Agent* agent) {
       agent->candidate_pairs[i].conncheck = 0;
       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
       return 0;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
-      agent->candidate_pairs[i].conncheck++;
-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
-        return 0;
-      }
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      agent->selected_pair = &agent->candidate_pairs[i];
+    }
+  }
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->nominated_pair = agent->selected_pair = &agent->candidate_pairs[i];
       return 0;
     }
+  }
+  // No pair at all yet (the peer's only candidate was an mDNS name, which is not resolved): wait for the peer's
+  // checks to add a peer-reflexive pair, as long as a pair would be checked.
+  if (agent->candidate_pairs_num == 0 && agent->wait_checks++ < AGENT_CONNCHECK_MAX) {
+    agent->nominated_pair = NULL;
+    return 0;
   }
   // all candidate pairs are failed
   return -1;

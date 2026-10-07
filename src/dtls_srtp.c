@@ -102,8 +102,13 @@ static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
 }
 
 // Do not verify CA
+// SpawnDev: nor the validity dates. A WebRTC peer is identified by the certificate FINGERPRINT from the SDP (checked
+// after the handshake), not by a chain or dates, and a device with no clock source has none to check them against:
+// a MiniRover car in play mode (its own WiFi, no internet, so no SNTP) has a clock near 1970 and rejected a desktop
+// peer's fresh certificate as not yet valid (MBEDTLS_X509_BADCERT_FUTURE -> alert certificate_unknown, measured).
 static int dtls_srtp_cert_verify(void* data, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
-  *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_BAD_KEY);
+  *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_BAD_KEY |
+              MBEDTLS_X509_BADCERT_FUTURE | MBEDTLS_X509_BADCERT_EXPIRED);
   return 0;
 }
 
@@ -163,7 +168,9 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
   mbedtls_x509write_crt_set_serial_raw(&crt, (unsigned char*)serial, strlen(serial));
 #endif
 
-  mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20280101000000");
+  // SpawnDev: was valid until 2028-01-01 only; a peer that checks dates would refuse every device from then on.
+  // The device's clock may be unset (no SNTP offline), so notBefore stays in the past.
+  mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20991231235959");
 
   ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
 

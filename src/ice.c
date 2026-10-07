@@ -15,6 +15,8 @@ static uint8_t ice_candidate_type_preference(IceCandidateType type) {
   switch (type) {
     case ICE_CANDIDATE_TYPE_HOST:
       return 126;
+    case ICE_CANDIDATE_TYPE_PRFLX:
+      return 110;
     case ICE_CANDIDATE_TYPE_SRFLX:
       return 100;
     case ICE_CANDIDATE_TYPE_RELAY:
@@ -121,10 +123,18 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   addr_set_port(&candidate->addr, port);
 
   if (strstr(addrstring, "local") != NULL) {
+#if CONFIG_MDNS_RESOLVE
     if (mdns_resolve_addr(addrstring, &candidate->addr) == 0) {
       LOGW("Failed to resolve mDNS address");
       return -1;
     }
+#else
+    // SpawnDev: not resolved. mdns_resolve_addr blocks for up to 15 s per name (3 queries x 5 waits of 1 s), and
+    // set_remote_description runs on the caller's thread (on nanoFramework: the whole CLR). The peer's real
+    // address is learned from its own connectivity checks instead (agent.c, peer-reflexive candidates).
+    LOGI("mDNS candidate %s skipped (learned from the peer's checks)", addrstring);
+    return -1;
+#endif
   } else if (addr_from_string(addrstring, &candidate->addr) == 0) {
     return -1;
   }
