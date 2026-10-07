@@ -40,6 +40,7 @@ struct PeerConnection {
   int agent_ret;
   int b_local_description_created;
   uint32_t dtls_start_ms;  // SpawnWear: ms when ICE reached CONNECTED, to delay the ANSWERER's ClientHello
+  uint32_t hs_tx, hs_rx;   // SpawnDev: datagrams sent / received while the DTLS handshake runs (diagnostics)
 
   Buffer* audio_rb;
   Buffer* video_rb;
@@ -76,6 +77,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   // froze the watch) and starved ICE (peer disconnected after ~8s during the DTLS handshake).
   ret = agent_recv(&pc->agent, buf, len);
   if (ret > 0) {
+    if (pc->state == PEER_CONNECTION_CONNECTED) pc->hs_rx++;
     return ret;
   }
   return MBEDTLS_ERR_SSL_WANT_READ;
@@ -112,6 +114,7 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
+  if (pc->state == PEER_CONNECTION_CONNECTED) pc->hs_tx++;
   return agent_send(&pc->agent, buf, len);
 }
 
@@ -816,6 +819,10 @@ int peer_connection_get_ice_stat(PeerConnection* pc, int which) {
     case 2: return pc->agent.selected_pair ? (int)pc->agent.selected_pair->remote->addr.sin.sin_addr.s_addr : 0;
     case 3: return pc->agent.candidate_pairs_num;
     case 4: return pc->agent.local_candidates_count;
+    case 5: return (int)pc->hs_tx;
+    case 6: return (int)pc->hs_rx;
+    case 7: return (int)pc->dtls_srtp.ssl.MBEDTLS_PRIVATE(state);
+    case 8: return (int)pc->sctp.stat_hs_retransmits;
   }
   return -1;
 }

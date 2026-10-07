@@ -225,6 +225,15 @@ typedef struct Sctp {
   uint32_t test_drop_permille; /* test hook: drop this share of outgoing DATA datagrams */
   uint32_t test_dropped;
 
+  /* SpawnDev: association handshake retransmission (RFC 4960 T1-init / T1-cookie). The INIT and the COOKIE ECHO
+   * were sent once; one lost datagram left the association half open and no data channel ever opened. */
+  uint8_t hs_state;   /* 0 idle / done, 1 INIT sent (wait INIT-ACK), 2 COOKIE ECHO sent (wait COOKIE-ACK) */
+  uint8_t hs_tries;
+  uint16_t hs_len;
+  uint32_t hs_sent_ms;
+  uint8_t* hs_pkt;    /* the last INIT / COOKIE ECHO exactly as sent */
+  uint32_t stat_hs_retransmits;
+
   uint8_t buf[CONFIG_MTU];
 } Sctp;
 

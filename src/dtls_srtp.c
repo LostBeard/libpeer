@@ -443,7 +443,14 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
 
   static mbedtls_timing_delay_context timer;
 
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  // SpawnDev: install the timer ONCE per handshake. mbedtls_ssl_set_timer_cb ends with mbedtls_ssl_set_timer(ssl, 0),
+  // i.e. it CANCELS the running timer, and this function runs on every pump pass of the non-blocking handshake, so
+  // the retransmission timer was reset every ~10 ms and never fired: a lost first flight was never resent (measured:
+  // ClientHello sent once, nothing received, mbedTLS state 2 for 30 s; the "no working non-blocking retransmission"
+  // that the answerer's start delay below works around). A fresh ssl context has p_timer NULL.
+  if (dtls_srtp->ssl.MBEDTLS_PRIVATE(p_timer) != &timer) {
+    mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  }
 
 #if CONFIG_MBEDTLS_2_X
   mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);

@@ -227,8 +227,41 @@ void sctp_set_stream_unreliable(Sctp* sctp, uint16_t sid, int unreliable) {
   if (sctp && sid < SCTP_TRACKED_SIDS) sctp->sid_unreliable[sid] = unreliable ? 1 : 0;
 }
 
+#if !CONFIG_USE_USRSCTP
+#define SCTP_HS_RTO_MS 1000
+#define SCTP_HS_MAX_TRIES 8
+
+// SpawnDev: keeps the handshake packet just sent (INIT or COOKIE ECHO) for sctp_tick to resend.
+static void sctp_hs_remember(Sctp* sctp, int state, const uint8_t* pkt, int len) {
+  if (len <= 0 || len > CONFIG_MTU) return;
+  if (!sctp->hs_pkt) sctp->hs_pkt = (uint8_t*)malloc(CONFIG_MTU);
+  if (!sctp->hs_pkt) return;
+  memcpy(sctp->hs_pkt, pkt, len);
+  sctp->hs_len = (uint16_t)len;
+  sctp->hs_state = (uint8_t)state;
+  sctp->hs_tries = 0;
+  sctp->hs_sent_ms = ports_get_epoch_time();
+}
+#endif
+
 void sctp_tick(Sctp* sctp) {
 #if !CONFIG_USE_USRSCTP
+  if (sctp && sctp->hs_state && sctp->hs_pkt) {
+    // T1-init / T1-cookie: resend until the INIT-ACK / COOKIE-ACK comes, doubling the wait, then give up (the
+    // managed side's channel-open timeout reports the failure).
+    uint32_t hs_now = ports_get_epoch_time();
+    uint32_t rto = SCTP_HS_RTO_MS << (sctp->hs_tries < 3 ? sctp->hs_tries : 3);
+    if (hs_now - sctp->hs_sent_ms >= rto) {
+      if (sctp->hs_tries >= SCTP_HS_MAX_TRIES) {
+        sctp->hs_state = 0;
+      } else {
+        dtls_srtp_write(sctp->dtls_srtp, sctp->hs_pkt, sctp->hs_len);
+        sctp->hs_tries++;
+        sctp->hs_sent_ms = hs_now;
+        sctp->stat_hs_retransmits++;
+      }
+    }
+  }
   if (!sctp || !sctp->connected || !sctp->tx_valid) return;
   uint32_t now = ports_get_epoch_time();
   if (now - sctp->tx_last_tick_ms < 10) return;
@@ -618,6 +651,11 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
     if (chunk_len < sizeof(SctpChunkCommon) || pos + chunk_len > len)
       break;  // malformed: stop rather than loop forever or read past the packet
 
+    // SpawnDev: DATA or SACK from the peer means it took our COOKIE ECHO even if its COOKIE-ACK was lost.
+    if (sctp->hs_state == 2 && (chunk_common->type == SCTP_DATA || chunk_common->type == SCTP_SACK)) {
+      sctp->hs_state = 0;
+    }
+
     switch (chunk_common->type) {
       case SCTP_DATA: {
         // SpawnDev: every DATA chunk in the packet is processed (Chrome bundles small messages), fragments are
@@ -669,6 +707,12 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       } break;
       case SCTP_INIT_ACK: {
         SctpInitChunk* init_ack = (SctpInitChunk*)(buf + pos);
+        if (sctp->hs_state == 2) {
+          // A duplicate INIT-ACK (our INIT was resent): the COOKIE ECHO already went out and is on its own timer.
+          length = 0;
+          break;
+        }
+        sctp->hs_state = 0;
         SctpCookieEchoChunk* cookie_echo = (SctpCookieEchoChunk*)out_packet->chunks;
         sctp->rx_cum_tsn = ntohl(init_ack->initial_tsn) - 1;
         sctp->rx_gap_bits = 0;
@@ -722,6 +766,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
         pos = len;  // Do not handle other msg
       } break;
       case SCTP_COOKIE_ACK: {
+        sctp->hs_state = 0;  // SpawnDev: the association is up; stop resending the COOKIE ECHO
         break;
       }
       case SCTP_ABORT:
@@ -746,6 +791,9 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       length = (4 * ((length + 3) / 4));
       out_packet->header.checksum = sctp_get_checksum(sctp, sctp->buf, length);
       dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
+      if (((SctpChunkCommon*)out_packet->chunks)->type == SCTP_COOKIE_ECHO) {
+        sctp_hs_remember(sctp, 2, sctp->buf, length);  // SpawnDev: resent by sctp_tick until COOKIE-ACK
+      }
       // sctp_outgoing_data_cb(sctp, sctp->buf, SCTP_MTU, 0, 0);
     }
     if (pos >= len)
@@ -975,6 +1023,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   length = (4 * ((length + 3) / 4));
   header->checksum = sctp_get_checksum(sctp, sctp->buf, length);
   dtls_srtp_write(sctp->dtls_srtp, sctp->buf, length);
+  sctp_hs_remember(sctp, 1, sctp->buf, length);  // SpawnDev: resent by sctp_tick until INIT-ACK
 #endif
 
   return 0;
@@ -996,6 +1045,9 @@ void sctp_destroy_association(Sctp* sctp) {
   }
   if (sctp) {
     // SpawnDev: send window + retransmission store
+    free(sctp->hs_pkt);
+    sctp->hs_pkt = NULL;
+    sctp->hs_state = 0;
     free(sctp->tx);
     free(sctp->tx_store);
     sctp->tx = NULL;
